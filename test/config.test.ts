@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { DEFAULT_SETTINGS, loadConfig, maskKey, resolveKeyFromLocal, storeApiKey, userConfigPath, type SearloSettings } from "../src/config.ts";
+import { DEFAULT_SETTINGS, loadConfig, maskKey, resolveKeyFromLocal, storeApiKey, userConfigPath, warnLowCredits, type SearloSettings } from "../src/config.ts";
 
 /** Points PI_CODING_AGENT_DIR at a scratch dir so userConfigPath() is hermetic. */
 function withAgentDir(run: (dir: string) => void) {
@@ -233,4 +233,22 @@ test("storeApiKey rejects an empty key", () => {
 	withAgentDir(() => {
 		assert.throws(() => storeApiKey("   ", userConfigPath()), /empty key/);
 	});
+});
+
+test("warnLowCredits flags low balances and stays quiet otherwise", () => {
+	assert.equal(warnLowCredits({ available: 5000, isLowBalance: false, elapsedMs: 10 }), undefined, "a healthy balance is no news");
+	assert.equal(warnLowCredits({ available: 100, isLowBalance: false, elapsedMs: 10 }), undefined, "the threshold itself is not low");
+
+	const below = warnLowCredits({ available: 80, isLowBalance: false, elapsedMs: 10 });
+	assert.match(below ?? "", /80 credit\(s\)/);
+	assert.match(below ?? "", /top up/i);
+	assert.match(below ?? "", /\/searlo credits/);
+
+	const flagged = warnLowCredits({ available: 3, isLowBalance: true, elapsedMs: 10 });
+	assert.match(flagged ?? "", /3 credit\(s\)/);
+
+	// The account flags a low balance without a number: still worth one warning.
+	assert.match(warnLowCredits({ isLowBalance: true, elapsedMs: 10 }) ?? "", /low balance/);
+
+	assert.equal(warnLowCredits({ elapsedMs: 10 }), undefined, "nothing reported means nothing to warn about");
 });

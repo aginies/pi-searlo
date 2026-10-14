@@ -30,6 +30,7 @@ import {
 	setConfigValue,
 	storeApiKey,
 	userConfigPath,
+	warnLowCredits,
 	writeConfigTemplate,
 	resolveKeyFromLocal,
 	type ResolvedKey,
@@ -37,11 +38,17 @@ import {
 	type SearloMode,
 	type SearloSettings,
 } from "./config.ts";
-import { SearloError, resultCount, search, type SearchResponse } from "./client.ts";
-import { CONTEXT_TYPE, describeRaw, formatError, formatResults, summarize } from "./format.ts";
+import { SearloError, creditBalance, resultCount, search, type SearchResponse } from "./client.ts";
+import { CONTEXT_TYPE, describeBalance, describeRaw, formatError, formatResults, summarize } from "./format.ts";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const TOOL_NAME = "searlo_search";
+
+/**
+ * The most session_start waits for the free balance check. A dead network may delay opening a
+ * session by this much and no further; the warning itself is best-effort.
+ */
+const SESSION_BALANCE_TIMEOUT_MS = 1000;
 const AUTH_PROVIDER = "searlo";
 const STATUS_KEY = "searlo";
 
@@ -453,6 +460,24 @@ async function handleSearloArgs(args: string, pi: ExtensionAPI, ctx: ExtensionCo
 		return;
 	}
 
+	if (sub === "credits" || sub === "balance") {
+		// A balance read is free and mode-independent: you want to see the number even while
+		// mode is "off", and the call spends nothing.
+		const key = state.key.key;
+		if (!key) {
+			ctx.ui.notify(`searlo: no API key — ${configError(state) ?? "configure one"}`, "warning");
+			return;
+		}
+		ctx.ui.notify("searlo: checking credit balance…", "info");
+		try {
+			const balance = await creditBalance(state.settings, key);
+			ctx.ui.notify(`searlo ${describeBalance(balance)}`, "info");
+		} catch (error) {
+			ctx.ui.notify(`searlo failed: ${formatError(error)}`, "error");
+		}
+		return;
+	}
+
 	if (sub === "toon" || sub === "output") {
 		const ask = rest[0]?.toLowerCase();
 		const wanted = TOON_WORDS.get(ask ?? "");
@@ -569,7 +594,7 @@ async function handleSearloArgs(args: string, pi: ExtensionAPI, ctx: ExtensionCo
 		ctx.ui.notify(
 			[
 				`mode: ${state.settings.mode} · vertical: ${state.settings.vertical} · key: ${state.key.key ? describeKey(state) : "not configured"}`,
-				`/searlo <query> · /searlo ${VERTICAL_NAMES.join("|")}: <query> · /searlo off|manual|on|auto · /searlo toon on|off · /searlo vertical <name> · /searlo test · /searlo config`,
+				`/searlo <query> · /searlo ${VERTICAL_NAMES.join("|")}: <query> · /searlo off|manual|on|auto · /searlo toon on|off · /searlo vertical <name> · /searlo test · /searlo credits · /searlo config`,
 			].join("\n"),
 			"info",
 		);
@@ -616,9 +641,9 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("searlo", {
-		description: `Search the web via Searlo: /searlo <query> | images:\u003cquery> | off | manual | on | auto | toon on|off | vertical <name> | test | login | config | init (${binding} opens the picker)`,
+		description: `Search the web via Searlo: /searlo <query> | images:\u003cquery> | off | manual | on | auto | toon on|off | vertical <name> | test | credits | login | config | init (${binding} opens the picker)`,
 		getArgumentCompletions: (prefix) => {
-			const words = ["off", "manual", "on", "auto", "toon", "test", "config", "login", "init", "raw", "vertical", "default", ...VERTICAL_NAMES];
+			const words = ["off", "manual", "on", "auto", "toon", "test", "credits", "balance", "config", "login", "init", "raw", "vertical", "default", ...VERTICAL_NAMES];
 			const head = prefix.trim();
 			const hits = words.filter((word) => word.startsWith(head));
 			return hits.length ? hits.map((label) => ({ value: `${label} `, label })) : null;
@@ -644,6 +669,19 @@ export default function (pi: ExtensionAPI) {
 		// "ready" would be a lie in the mode that refuses every search, so say what is disabled.
 		else if (searchForbidden(state.settings.mode)) ctx.ui.notify(offMessage(state.settings), "info");
 		else ctx.ui.notify(`searlo ready (${describeMode(state)}) · ${describeKey(state)}`, "info");
+
+		// Best-effort low-balance warning: free call, hard cap below, silent on any failure. A 402
+		// mid-session is a worse surprise than one extra line at startup.
+		if (state.key.key && !searchForbidden(state.settings.mode)) {
+			const key = state.key.key;
+			try {
+				const balance = await creditBalance(state.settings, key, { signal: AbortSignal.timeout(SESSION_BALANCE_TIMEOUT_MS) });
+				const low = warnLowCredits(balance);
+				if (low) ctx.ui.notify(`searlo: ${low}`, "warning");
+			} catch {
+				// A balance check that fails at startup tells the user nothing they need yet.
+			}
+		}
 	});
 
 	pi.on("agent_end", () => {

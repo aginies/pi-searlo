@@ -199,6 +199,7 @@ reported as a warning and the turn continues unsearched — auto mode never bloc
 /searlo toon [on|off] [--save]  hand the model a TOON table instead of the text list
 /searlo vertical <name> [--save]  search type for this session, or persisted with --save
 /searlo test [query]      one search, with latency, cache HIT/MISS and credits remaining
+/searlo credits           the account's credit balance (free — it reads, it never spends)
 /searlo raw [query]       print the field names of the first raw item (shape diagnosis)
 /searlo config            effective settings and which files contributed them
 /searlo login             prompt for a key and store it in searlo.json (0600)
@@ -278,9 +279,11 @@ Everything degrades to "no search happened" rather than blocking your turn:
 | Problem | Result |
 |---|---|
 | no key | `session_start` warning, tool call errors with the fix, never crashes |
+| low credit balance at `session_start` | one warning with the balance and the top-up link; the check waits at most 1 s at session open, and searches keep working until the credits are actually gone |
 | HTTP 401/403 | `auth` error naming the status, the key is never echoed |
 | HTTP 400 `VALIDATION_ERROR` | `api` error quoting `code`, `message` and the offending field, not the raw JSON body |
 | HTTP 429 | `rate-limit` error, so callers can back off |
+| HTTP 402 `INSUFFICIENT_CREDITS` | `insufficient-credits` error pointing at the dashboard and `/searlo credits` — the fix is an action, not a retry |
 | HTTP 503 `retryable: true` (shopping) | `http` error stating the upstream is temporarily blocked |
 | `success: false` in a 200 body | `api` error carrying the API's own message |
 | HTML or truncated body instead of JSON | `shape` error stating what was received |

@@ -1,6 +1,6 @@
 {
 	"name": "pi-searlo",
-	"version": "0.1.2",
+	"version": "0.1.3",
 	"description": "Perplexity-style fresh web data for pi, backed by the Searlo search API",
         "author": {
                 "name": "aginies",
@@ -24,9 +24,9 @@
 	"pi": {
 		"extensions": ["./src/index.ts"]
 	},
-	"file": [
+	"files": [
 		"src/client.ts",
-	      	"src/config.ts",
+		"src/config.ts",
 		"src/format.ts",
 		"src/index.ts",
 		"README.md"
@@ -38,6 +38,7 @@
 	},
 	"scripts": {
 		"test": "node --disable-warning=ExperimentalWarning --test 'test/**/*.test.ts'",
+		"typecheck": "tsc --noEmit",
 		"dev": "pi --extension ./src/index.ts"
 	},
         "publishConfig": {

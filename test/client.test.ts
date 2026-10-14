@@ -3,7 +3,7 @@ import test from "node:test";
 
 import { extractItems, normalizeItems, buildSearchUrl, SearloError } from "../src/client.ts";
 import { DEFAULT_SETTINGS, type SearloSettings } from "../src/config.ts";
-import { budgetItems, formatResults, summarize } from "../src/format.ts";
+import { budgetItems, describeBalance, formatResults, summarize } from "../src/format.ts";
 import type { SearchResponse, SearchResultItem } from "../src/client.ts";
 
 const settings: SearloSettings = { ...DEFAULT_SETTINGS };
@@ -164,6 +164,7 @@ test("budget keeps whole items and always keeps the first", () => {
 function response(items: SearchResultItem[], extra: Partial<SearchResponse> = {}): SearchResponse {
 	return {
 		query: "hello world",
+		vertical: "web",
 		url: "https://api.searlo.tech/api/v1/search/web?q=hello+world&limit=5",
 		status: 200,
 		elapsedMs: 12,
@@ -356,4 +357,27 @@ test("summarize reports index size, cache and credits", () => {
 	assert.match(line, /cache MISS/);
 	assert.match(line, /credits left 4999/);
 	assert.match(line, /top: One/);
+});
+
+test("describeBalance renders the balance, the low flag, and the next expiry", () => {
+	const full = describeBalance({
+		available: 4200,
+		isLowBalance: false,
+		nextExpiryAt: "2026-12-31T00:00:00Z",
+		nextExpiryAmount: 500,
+		daysUntilNextExpiry: 170,
+		elapsedMs: 12,
+	});
+	assert.match(full, /balance: 4200 credit\(s\)/);
+	assert.match(full, /next expiry: 2026-12-31T00:00:00Z \(in 170 day\(s\)\) · 500 credit\(s\) expire/);
+	assert.match(full, /\(12ms\)/);
+	assert.doesNotMatch(full, /low balance/);
+
+	const low = describeBalance({ available: 3, isLowBalance: true, elapsedMs: 12 });
+	assert.match(low, /balance: 3 credit\(s\)/);
+	assert.match(low, /low balance/);
+	assert.match(low, /HTTP 402/);
+
+	const bare = describeBalance({ elapsedMs: 12 });
+	assert.match(bare, /not reported/);
 });

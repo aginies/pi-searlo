@@ -18,7 +18,7 @@
  * first item so a surprise shape is a one-command diagnosis.
  */
 
-import { type SearchVertical, type SearloSettings, verticalSpec } from "./config.ts";
+import { SEARLO_DASHBOARD_URL, type SearchVertical, type SearloSettings, verticalSpec } from "./config.ts";
 
 export interface SearchResultItem {
 	title: string;
@@ -101,7 +101,13 @@ export type SearloErrorKind =
 	| "shape"
 	| "timeout"
 	| "api"
+	/** Searlo throttled the account (HTTP 429). */
 	| "rate-limit"
+	/**
+	 * The account's credits are exhausted (HTTP 402, code `INSUFFICIENT_CREDITS`).
+	 * Every paid endpoint fails with this until the balance is topped up.
+	 */
+	| "insufficient-credits"
 	/** Mode "off" refused the search, so nothing was sent and nothing was billed. */
 	| "disabled";
 
@@ -385,6 +391,99 @@ export async function search(settings: SearloSettings, query: string, options: S
 type JsonPayload = { parsed: true; value: object | null } | { parsed: false };
 
 /**
+ * The account's credit balance (GET /api/v1/credit/balance). The call is free: it reads the
+ * balance, it does not spend anything. Fields are optional because the endpoint documents them
+ * individually, and an account may report no upcoming expiry at all.
+ */
+export interface CreditBalance {
+	/** Credits available to spend now. */
+	available?: number;
+	/** True when the balance is below the account's low-balance threshold (100 by default). */
+	isLowBalance?: boolean;
+	/** When the next credit batch expires, if the account reports one. */
+	nextExpiryAt?: string;
+	/** How many credits expire then. */
+	nextExpiryAmount?: number;
+	/** Days until the next expiry. */
+	daysUntilNextExpiry?: number;
+	/** Elapsed time of the request, for /searlo credits output. */
+	elapsedMs: number;
+}
+
+/**
+ * Fetch the account's credit balance. Free — no credits are spent — but the key is still
+ * required, and failures map to the same SearloError kinds as search (including 402 as
+ * `insufficient-credits`, should the endpoint ever report a dead account).
+ */
+export async function creditBalance(settings: SearloSettings, key: string, options: { signal?: AbortSignal } = {}): Promise<CreditBalance> {
+	if (!key) {
+		throw new SearloError("no-key", "no Searlo API key configured — run /searlo login or set the key in searlo.json");
+	}
+
+	let url: URL;
+	try {
+		url = new URL(`${settings.baseUrl}${CREDIT_BALANCE_PATH}`);
+	} catch {
+		throw new SearloError(
+			"shape",
+			`invalid Searlo endpoint config: baseUrl="${settings.baseUrl}" ${CREDIT_BALANCE_PATH} must combine into a valid URL`,
+		);
+	}
+
+	const started = Date.now();
+	const timeout = AbortSignal.timeout(settings.timeoutMs);
+	const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
+
+	let response: Response;
+	try {
+		response = await fetch(url, {
+			method: "GET",
+			headers: { [settings.apiKeyHeader]: key, accept: "application/json" },
+			signal,
+		});
+	} catch (error) {
+		throw classifyFailure(error, timeout, settings.timeoutMs, options.signal);
+	}
+
+	let text: string;
+	try {
+		text = await response.text();
+	} catch (error) {
+		throw classifyFailure(error, timeout, settings.timeoutMs, options.signal);
+	}
+
+	const elapsedMs = Date.now() - started;
+	// The failing call IS the credits check, so this path keeps the top-up link but not the pointer back to /searlo credits.
+	if (!response.ok) throw httpFailure(response.status, text);
+
+	const parsed = parseJson(text);
+	if (!parsed.parsed) {
+		throw new SearloError("shape", `expected JSON from ${settings.baseUrl}${CREDIT_BALANCE_PATH}, got ${excerpt(text)}`, response.status);
+	}
+
+	const payload = asRecord(parsed.value);
+	// success:false with a 200 is the documented failure envelope.
+	if (payload["success"] === false) {
+		const message = readString(payload, ["error", "message", "detail"]) ?? "unspecified error";
+		throw new SearloError("api", `Searlo reported success:false — ${message}`, response.status);
+	}
+
+	// The documented shape nests the fields under `data`; a flat body is tolerated too.
+	const data = asRecord(payload["data"]);
+	const record = Object.keys(data).length > 0 ? data : payload;
+	const expiry = asRecord(record["expiry"]);
+
+	return {
+		available: readNumber(record, ["available", "balance"]),
+		isLowBalance: readBoolean(record, "isLowBalance"),
+		nextExpiryAt: readString(expiry, ["nextExpiryAt"]),
+		nextExpiryAmount: readNumber(expiry, ["nextExpiryAmount"]),
+		daysUntilNextExpiry: readNumber(expiry, ["daysUntilNextExpiry"]),
+		elapsedMs,
+	};
+}
+
+/**
  * A TOON array header: `results[2]{rank,title}:`, `items[0]:`, a root `[3]:`, or the same on a
  * list-item line (`- users[2]{id}:`). Requiring it is what keeps a plain-text upstream error —
  * `error: rate limited` reads as a TOON field line — from being served to the model as a result.
@@ -428,14 +527,28 @@ const ERROR_KIND_BY_STATUS: Record<number, SearloErrorKind> = {
 	401: "auth",
 	403: "auth",
 	429: "rate-limit",
+	402: "insufficient-credits",
 };
 
-function apiFailure(status: number, body: string): SearloError {
+/** The free account endpoint: it reads the balance, it never spends credits. */
+const CREDIT_BALANCE_PATH = "/api/v1/credit/balance";
+
+/** Map a non-OK HTTP response to the matching SearloError: the core mapping, with no credits pointer. */
+function httpFailure(status: number, body: string): SearloError {
 	const kind = ERROR_KIND_BY_STATUS[status] ?? "http";
 	const parsed = parseJson(body);
 	const detail = parsed.parsed ? describeErrorBody(asRecord(parsed.value)) : undefined;
 	const message = detail ?? excerpt(body);
-	return new SearloError(kind, `Searlo returned HTTP ${status}: ${message}`, status);
+	// A 402 is not an outage: the account has run out of credits, and the fix is an action, not a retry.
+	const hint = status === 402 ? ` — the account has run out of credits: top up at ${SEARLO_DASHBOARD_URL}` : "";
+	return new SearloError(kind, `Searlo returned HTTP ${status}: ${message}${hint}`, status);
+}
+
+/** A failed paid call: same mapping, plus the pointer to the free balance command. */
+function apiFailure(status: number, body: string): SearloError {
+	const error = httpFailure(status, body);
+	if (status !== 402) return error;
+	return new SearloError(error.kind, `${error.message} (balance: /searlo credits)`, status);
 }
 
 function describeErrorBody(envelope: RecordLike): string | undefined {

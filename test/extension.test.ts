@@ -31,7 +31,9 @@ const TOON_PAYLOAD = [
 interface Stub {
 	tools: any[];
 	commands: Record<string, any>;
-	handlers: Record<string, ((event: any, ctx: any) => any)[]>;
+	// Event handlers take (event, ctx); shortcut handlers take (ctx) only — one permissive signature
+	// so both call shapes type-check; `fire` always passes both.
+	handlers: Record<string, ((...args: any[]) => any)[]>;
 	active: string[];
 	notifications: { message: string; type?: string }[];
 	sentUserMessages: string[];
@@ -115,10 +117,28 @@ let server: Server;
 let baseUrl: string;
 let agentDir: string;
 let requests: string[] = [];
+/** What the mock answers for GET /credit/balance; a test sets it to drive one behaviour. */
+let balanceReply: { status: number; body: string } | undefined;
+
+/** The documented balance shape, healthy, so the session-start check stays silent in other tests. */
+const DEFAULT_BALANCE_BODY = JSON.stringify({
+	success: true,
+	data: {
+		available: 4200,
+		isLowBalance: false,
+		expiry: { nextExpiryAt: "2026-12-31T00:00:00Z", nextExpiryAmount: 500, daysUntilNextExpiry: 170 },
+	},
+});
 
 test.before(async () => {
 	server = createServer((req, res) => {
 		requests.push(req.url ?? "");
+		if ((req.url ?? "").startsWith("/api/v1/credit/balance")) {
+			const reply = balanceReply ?? { status: 200, body: DEFAULT_BALANCE_BODY };
+			res.writeHead(reply.status, { "content-type": "application/json" });
+			res.end(reply.body);
+			return;
+		}
 		const asked = new URL(req.url ?? "/", "http://mock").searchParams.get("q") ?? "";
 		// One query word selects the text answer, so the JSON tests keep their payload.
 		if (asked.includes("toontext")) {
@@ -148,6 +168,7 @@ test.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
 /** Writes a fresh agent dir so the extension's own config load sees our mock endpoint. */
 function useConfig(extra: Record<string, unknown> = {}) {
 	requests = [];
+	balanceReply = undefined;
 	agentDir = mkdtempSync(join(tmpdir(), "pi-searlo-ext-"));
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	delete process.env.SEARLO_API_KEY;
@@ -612,6 +633,7 @@ test("/searlo off is absolute while /searlo manual still answers /searlo <query>
 		const stub = makeStub();
 		searloExtension(stub.pi);
 		await fire(stub, "session_start", {});
+		requests = []; // the session-start balance check is free and not part of this count
 
 		await stub.commands["searlo"].handler("off", stub.ctx);
 		await stub.commands["searlo"].handler("latest searlo docs", stub.ctx);
@@ -635,6 +657,7 @@ test("the picker can switch to Off and back to a searching mode", async () => {
 		const stub = makeStub();
 		searloExtension(stub.pi);
 		await fire(stub, "session_start", {});
+		requests = []; // the session-start balance check is free and not part of this count
 		const binding = stub.handlers["shortcut:f3"][0];
 
 		stub.selectQueue = ["○ Off (no Searlo searches)"];
@@ -728,6 +751,7 @@ test("one query costs one request per turn", async () => {
 		const stub = makeStub();
 		searloExtension(stub.pi);
 		await fire(stub, "session_start", {});
+		requests = []; // the session-start balance check is free and not part of this count
 
 		const prompt = { messageType: "user", prompt: "what is the latest node lts release today" };
 		await fire(stub, "before_agent_start", prompt);
@@ -749,6 +773,7 @@ test("/searlo toon switches the model-facing block to a TOON table", async () =>
 		const stub = makeStub();
 		searloExtension(stub.pi);
 		await fire(stub, "session_start", {});
+		requests = []; // the session-start balance check is free and not part of this count
 
 		const asText = await stub.tools[0].execute("tc1", { query: "the latest release today" }, undefined, undefined, { cwd: process.cwd() });
 		assert.match(asText.content[0].text, /<searlo_results/, "default rendering is the readable list");
@@ -911,6 +936,89 @@ test("missing key is reported once at session start and blocks no handler", asyn
 
 		const result = await fire(stub, "before_agent_start", { messageType: "user", prompt: "the latest release today please" });
 		assert.deepEqual(result, [undefined]);
+	} finally {
+		cleanup();
+	}
+});
+
+test("/searlo credits reports the balance without running a search", async () => {
+	useConfig({ mode: "manual" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+		requests = [];
+
+		await stub.commands["searlo"].handler("credits", stub.ctx);
+		assert.match(requests.at(-1) ?? "", /^\/api\/v1\/credit\/balance/);
+		assert.equal(stub.sentUserMessages.length, 0, "a balance check is not a search");
+		const notes = stub.notifications.map((note) => note.message).join(" ");
+		assert.match(notes, /balance: 4200 credit\(s\)/);
+		assert.match(notes, /next expiry: 2026-12-31T00:00:00Z/);
+		assert.doesNotMatch(notes, /sk_wired_key_1234/);
+	} finally {
+		cleanup();
+	}
+});
+
+test("/searlo credits without a key asks for one and makes no request", async () => {
+	useConfig({ apiKey: undefined });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+		requests = [];
+
+		await stub.commands["searlo"].handler("credits", stub.ctx);
+		assert.deepEqual(requests, []);
+		assert.match(stub.notifications.at(-1)!.message, /no API key/);
+	} finally {
+		cleanup();
+	}
+});
+
+test("session start warns when the balance is low", async () => {
+	useConfig({ mode: "tool" });
+	balanceReply = { status: 200, body: JSON.stringify({ success: true, data: { available: 3, isLowBalance: true, expiry: {} } }) };
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+		const notes = stub.notifications.map((note) => note.message).join(" ");
+		assert.match(notes, /credits are low \(3 credit\(s\)\)/);
+		assert.match(notes, /top up/i);
+		assert.match(notes, /\/searlo credits/);
+	} finally {
+		cleanup();
+	}
+});
+
+test("a failing balance check never blocks session start", async () => {
+	useConfig({ mode: "tool" });
+	balanceReply = { status: 500, body: "boom" };
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+		const notes = stub.notifications.map((note) => note.message).join(" ");
+		assert.match(notes, /searlo ready/, "the ready line still shows");
+		assert.doesNotMatch(notes, /boom/);
+	} finally {
+		cleanup();
+	}
+});
+
+test("/searlo credits answers even while mode is off", async () => {
+	useConfig({ mode: "off" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+		assert.deepEqual(requests, [], "off must not spend even the free balance check at startup");
+
+		await stub.commands["searlo"].handler("credits", stub.ctx);
+		assert.match(requests.at(-1) ?? "", /^\/api\/v1\/credit\/balance/, "an explicit balance read is not a search");
+		assert.match(stub.notifications.at(-1)!.message, /balance: 4200/);
 	} finally {
 		cleanup();
 	}

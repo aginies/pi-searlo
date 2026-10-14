@@ -12,6 +12,7 @@
 import { existsSync, chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import type { CreditBalance } from "./client.ts";
 
 export const CONFIG_BASENAME = "searlo.json";
 export const DEFAULT_API_KEY_ENV = "SEARLO_API_KEY";
@@ -159,6 +160,9 @@ export interface SearloSettings {
 		minPromptChars: number;
 	};
 }
+
+/** Where the account can be topped up, for messages that need to point there. */
+export const SEARLO_DASHBOARD_URL = "https://dashboard.searlo.tech";
 
 export const DEFAULT_SETTINGS: SearloSettings = {
 	baseUrl: "https://api.searlo.tech",
@@ -466,6 +470,24 @@ const MASK_REVEAL_MIN_LENGTH = 16;
 export function maskKey(key: string): string {
 	if (key.length <= MASK_REVEAL_MIN_LENGTH) return "*".repeat(key.length);
 	return `${key.slice(0, 5)}…${key.slice(-4)} (${key.length} chars)`;
+}
+
+/**
+ * A one-shot low-balance warning for session start. Returns undefined when there is nothing to
+ * say: no balance reported, the account itself does not flag the balance as low, or the balance is
+ * comfortably above the threshold. The threshold is deliberately high (100) because a web search
+ * costs one credit and a session can burn dozens before the user notices.
+ */
+export function warnLowCredits(balance: CreditBalance, threshold = 100): string | undefined {
+	const available = balance.available;
+	if (available === undefined) return balance.isLowBalance ? lowBalanceMessage(undefined) : undefined;
+	if (!balance.isLowBalance && available >= threshold) return undefined;
+	return lowBalanceMessage(available);
+}
+
+function lowBalanceMessage(available: number | undefined): string {
+	const shown = available !== undefined ? `${available} credit(s)` : "a low balance";
+	return `Searlo credits are low (${shown}) — searches will start failing with HTTP 402. Top up at ${SEARLO_DASHBOARD_URL} or check the balance with /searlo credits`;
 }
 
 export function defaultConfigTemplate(): string {

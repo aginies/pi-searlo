@@ -3,12 +3,13 @@ import { createServer, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, before, test } from "node:test";
 
-import { resultCount, SearloError, search, buildSearchUrl } from "../src/client.ts";
+import { creditBalance, resultCount, SearloError, search, buildSearchUrl } from "../src/client.ts";
 import { DEFAULT_SETTINGS, type SearloSettings } from "../src/config.ts";
 
 /** Query strings that select a mock behaviour, so each test drives exactly one path. */
 const MODE_BY_QUERY: Record<string, string> = {
 	"401": "auth",
+	"402": "insufficient",
 	"400": "400",
 	"500": "http",
 	html: "html",
@@ -36,6 +37,8 @@ const TOON_BODY = [
 let server: Server;
 let baseUrl: string;
 const seen: { url: string; headers: Record<string, string | string[] | undefined> }[] = [];
+/** Selects the /credit/balance mock behaviour; tests set it before each call. */
+let balanceMode = "ok";
 
 /** The mock answers whatever the `q` parameter asks for, so each test drives one behaviour. */
 function reply(mode: string, res: ServerResponse) {
@@ -43,6 +46,16 @@ function reply(mode: string, res: ServerResponse) {
 		case "auth":
 			res.writeHead(401, { "content-type": "application/json" });
 			res.end(JSON.stringify({ error: "invalid api key" }));
+			return;
+		case "insufficient":
+			res.writeHead(402, { "content-type": "application/json" });
+			res.end(
+				JSON.stringify({
+					success: false,
+					code: "INSUFFICIENT_CREDITS",
+					message: "Your credits have run out. Top up to continue using the API.",
+				}),
+			);
 			return;
 		case "http":
 			res.writeHead(500, { "content-type": "text/plain" });
@@ -124,9 +137,47 @@ function reply(mode: string, res: ServerResponse) {
 	}
 }
 
+/** The credit-balance endpoint answers by `balanceMode`, so each test drives one shape. */
+function replyBalance(res: ServerResponse) {
+	switch (balanceMode) {
+		case "flat":
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end(JSON.stringify({ success: true, available: 7, isLowBalance: true }));
+			return;
+		case "auth":
+			res.writeHead(401, { "content-type": "application/json" });
+			res.end(JSON.stringify({ error: "invalid api key" }));
+			return;
+		case "402":
+			res.writeHead(402, { "content-type": "application/json" });
+			res.end(JSON.stringify({ success: false, code: "INSUFFICIENT_CREDITS", message: "credits exhausted" }));
+			return;
+		case "plain":
+			res.writeHead(200, { "content-type": "text/plain" });
+			res.end("nope");
+			return;
+		default:
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end(
+				JSON.stringify({
+					success: true,
+					data: {
+						available: 4200,
+						isLowBalance: false,
+						expiry: { nextExpiryAt: "2026-12-31T00:00:00Z", nextExpiryAmount: 500, daysUntilNextExpiry: 170 },
+					},
+				}),
+			);
+	}
+}
+
 before(async () => {
 	server = createServer((req, res) => {
 		seen.push({ url: req.url ?? "", headers: req.headers });
+		if ((req.url ?? "").startsWith("/api/v1/credit/balance")) {
+			replyBalance(res);
+			return;
+		}
 		const query = new URL(req.url ?? "/", "http://x").searchParams.get("q") ?? "";
 		reply(MODE_BY_QUERY[query] ?? "ok", res);
 	});
@@ -221,6 +272,75 @@ test("reports the auth failure without echoing the key", async () => {
 		search(settings(), "401", { key: "sk_secret_value" }),
 		(error) => error instanceof SearloError && error.kind === "auth" && !error.message.includes("sk_secret_value"),
 	);
+});
+
+test("HTTP 402 is an insufficient-credits error with an actionable message", async () => {
+	await assert.rejects(
+		search(settings(), "402", { key: "k" }),
+		(error) => {
+			if (!(error instanceof SearloError) || error.kind !== "insufficient-credits" || error.status !== 402) return false;
+			assert.match(error.message, /INSUFFICIENT_CREDITS/);
+			assert.match(error.message, /top up/i, "the message points at the fix, not at a retry");
+			assert.match(error.message, /\/searlo credits/, "the message names the balance command");
+			return true;
+		},
+	);
+});
+
+test("creditBalance reads the documented balance shape", async () => {
+	seen.length = 0;
+	balanceMode = "ok";
+	const balance = await creditBalance(settings(), "sk_test_1234567890");
+
+	assert.equal(seen.length, 1);
+	assert.equal(seen[0].url, "/api/v1/credit/balance");
+	assert.equal(seen[0].headers["x-api-key"], "sk_test_1234567890");
+	assert.equal(balance.available, 4200);
+	assert.equal(balance.isLowBalance, false);
+	assert.equal(balance.nextExpiryAt, "2026-12-31T00:00:00Z");
+	assert.equal(balance.nextExpiryAmount, 500);
+	assert.equal(balance.daysUntilNextExpiry, 170);
+	assert.ok(balance.elapsedMs >= 0);
+});
+
+test("creditBalance tolerates a flat body without the data wrapper", async () => {
+	balanceMode = "flat";
+	const balance = await creditBalance(settings(), "k");
+	assert.equal(balance.available, 7);
+	assert.equal(balance.isLowBalance, true);
+	balanceMode = "ok";
+});
+
+test("creditBalance maps 401 to auth and a non-JSON body to shape", async () => {
+	balanceMode = "auth";
+	await assert.rejects(
+		creditBalance(settings(), "k"),
+		(error) => error instanceof SearloError && error.kind === "auth" && error.status === 401,
+	);
+	balanceMode = "plain";
+	await assert.rejects(creditBalance(settings(), "k"), (error) => error instanceof SearloError && error.kind === "shape");
+	balanceMode = "ok";
+});
+
+test("creditBalance without a key fails before any request is sent", async () => {
+	seen.length = 0;
+	await assert.rejects(creditBalance(settings(), ""), (error) => error instanceof SearloError && error.kind === "no-key");
+	assert.equal(seen.length, 0);
+});
+
+test("a 402 from the balance endpoint does not point back at /searlo credits", async () => {
+	balanceMode = "402";
+	await assert.rejects(
+		creditBalance(settings(), "k"),
+		(error) => {
+			if (!(error instanceof SearloError) || error.kind !== "insufficient-credits" || error.status !== 402) return false;
+			assert.match(error.message, /INSUFFICIENT_CREDITS/);
+			assert.match(error.message, /top up/i, "the actionable part stays: this call failing is the news itself");
+			assert.doesNotMatch(error.message, /\/searlo credits/, "the failing call already IS the credits check");
+			return true;
+		},
+	);
+	balanceMode = "ok";
 });
 
 test("classifies server errors, html bodies and broken json", async () => {

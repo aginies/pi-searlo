@@ -8,7 +8,7 @@
  * tokens than the same results as JSON.
  */
 
-import { resultCount, type SearchResponse, type SearchResultItem } from "./client.ts";
+import { resultCount, type CreditBalance, type SearchResponse, type SearchResultItem } from "./client.ts";
 import { type SearchVertical, verticalSpec } from "./config.ts";
 
 export const CONTEXT_TYPE = "searlo:context";
@@ -263,6 +263,26 @@ export function summarize(response: SearchResponse): string {
 	if (response.account.creditsRemaining !== undefined) parts.push(`credits left ${response.account.creditsRemaining}`);
 	else if (response.account.creditsDeducted !== undefined) parts.push(`credits used ${response.account.creditsDeducted}`);
 	if (top) parts.push(`top: ${oneLine(top.title, 70)}`);
+	return parts.join(" · ");
+}
+
+/** The line(s) `/searlo credits` prints: the balance, the low flag, and the next expiry. */
+export function describeBalance(balance: CreditBalance): string {
+	const parts: string[] = [];
+	if (balance.available !== undefined) {
+		parts.push(`balance: ${balance.available} credit(s)`);
+		if (balance.isLowBalance) parts.push("⚠ low balance — searches will start failing with HTTP 402");
+	} else if (balance.isLowBalance) {
+		parts.push("⚠ low balance reported (no number in the response)");
+	} else {
+		parts.push("balance: not reported in the response");
+	}
+	if (balance.nextExpiryAt) {
+		const when = balance.daysUntilNextExpiry !== undefined ? ` (in ${balance.daysUntilNextExpiry} day(s))` : "";
+		const amount = balance.nextExpiryAmount !== undefined ? ` · ${balance.nextExpiryAmount} credit(s) expire` : "";
+		parts.push(`next expiry: ${balance.nextExpiryAt}${when}${amount}`);
+	}
+	parts.push(`(${balance.elapsedMs}ms)`);
 	return parts.join(" · ");
 }
 
