@@ -133,6 +133,12 @@ export interface SearloSettings {
 	timeoutMs: number;
 	/** Search policy for this session: off | manual | tool | auto. */
 	mode: SearloMode;
+	/**
+	 * Ask Searlo for TOON (`format=toon`) and hand the model a TOON block instead of the text list:
+	 * one header line naming the columns, then one row per result, so the same results cost fewer
+	 * tokens. Off by default because the citation list format is the one pi users see in logs.
+	 */
+	toon: boolean;
 	/** Max characters of snippet text handed to the model per search. */
 	contentBudgetChars: number;
 	/** Emit the citation/rules preamble in search context blocks. */
@@ -165,6 +171,7 @@ export const DEFAULT_SETTINGS: SearloSettings = {
 	params: {},
 	timeoutMs: 8000,
 	mode: "tool",
+	toon: false,
 	contentBudgetChars: 6000,
 	includeCitations: true,
 	shortcut: "f3",
@@ -339,6 +346,7 @@ function normalize(settings: SearloSettings): SearloSettings {
 		params: toStringParams(settings.params),
 		page: clampInt(settings.page, 1, 1, 100),
 		mode: isMode(mode) ? mode : DEFAULT_SETTINGS.mode,
+		toon: normalizeBool(settings.toon, DEFAULT_SETTINGS.toon),
 		includeCitations: settings.includeCitations !== false,
 		shortcut: normalizeShortcut(settings.shortcut),
 		showStatus: normalizeBool(settings.showStatus, true),
@@ -380,8 +388,6 @@ function merge(base: SearloSettings, layer: Record<string, unknown> | undefined)
 export interface LoadOptions {
 	/** Project directory enabling `.pi/searlo.json`. Omit to load user config only. */
 	cwd?: string;
-	/** `pi.getSettings().searlo`, trusted local overrides. */
-	overrides?: unknown;
 	/** Force a re-read of the files, bypassing the mtime cache. */
 	force?: boolean;
 }
@@ -402,7 +408,7 @@ export function loadConfig(options: LoadOptions = {}): LoadedConfig {
 	const stamp = paths.map((p) => fileStamp(p) ?? "-").join("|");
 
 	if (!options.force && cache && cache.key === stamp) {
-		return applyOverrides(cache.config, options.overrides);
+		return cache.config;
 	}
 
 	const errors: string[] = [];
@@ -419,13 +425,7 @@ export function loadConfig(options: LoadOptions = {}): LoadedConfig {
 
 	const config: LoadedConfig = { settings, sources, errors, usingDefaults: sources.length === 0 };
 	cache = { key: stamp ?? "-", config };
-	return applyOverrides(config, options.overrides);
-}
-
-function applyOverrides(config: LoadedConfig, overrides: unknown): LoadedConfig {
-	if (!isCliArg(overrides)) return config;
-	const settings = normalize(merge({ ...config.settings, errors: config.errors }, overrides as Record<string, unknown>));
-	return { settings, sources: [...config.sources], errors: config.errors, usingDefaults: config.usingDefaults };
+	return config;
 }
 
 export type KeySource = "env" | "config" | "auth" | "none";
@@ -455,8 +455,16 @@ export function resolveKeyFromLocal(settings: SearloSettings): ResolvedKey {
 	return { source: "none" };
 }
 
+/**
+ * Below this length the "masked" form is not masked: five characters plus four would be most of a
+ * short key, and nine of them reproduce a nine-character key in full. That string ends up in
+ * notifications and in `/searlo config`, both of which pi records in the transcript.
+ */
+const MASK_REVEAL_MIN_LENGTH = 16;
+
+/** A key reduced to something safe to print: stars, or a prefix and suffix of a long key. */
 export function maskKey(key: string): string {
-	if (key.length <= 8) return "*".repeat(key.length);
+	if (key.length <= MASK_REVEAL_MIN_LENGTH) return "*".repeat(key.length);
 	return `${key.slice(0, 5)}…${key.slice(-4)} (${key.length} chars)`;
 }
 
@@ -472,6 +480,8 @@ export function defaultConfigTemplate(): string {
 		// "off" refuses every search, "manual" is /searlo only, "tool" lets the model search,
 		// "auto" also injects into every matching prompt.
 		mode: "tool",
+		// true sends format=toon and gives the model a TOON table instead of the text list.
+		toon: false,
 		// Opens the mode/vertical picker; any pi KeyId works, e.g. "ctrl+g".
 		shortcut: "f3",
 		showStatus: true,

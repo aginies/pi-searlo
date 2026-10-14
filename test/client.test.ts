@@ -198,6 +198,97 @@ test("omits the grounding preamble when citations are off", () => {
 	assert.match(block, /\[1\] One/);
 });
 
+/** The whole TOON document for a fixed set of results, so the table is asserted as text. */
+function toonBlock(items: SearchResultItem[], extra: Partial<SearchResponse> = {}): string {
+	return formatResults(response(items, extra), { budgetChars: 6000, includeCitations: false, toon: true });
+}
+
+test("toon renders a header line naming the columns, then one row per result", () => {
+	const block = toonBlock(
+		normalizeItems([
+			{ rank: 1, title: "First", link: "https://a.test/1", snippet: "alpha, with a comma", domain: "a.test" },
+			{ rank: 2, title: "Second", link: "https://b.test/2", snippet: "beta", domain: "b.test" },
+		]),
+		{ vertical: "web" },
+	);
+
+	assert.doesNotMatch(block, /<searlo_results/, "the TOON document replaces the text block");
+	assert.match(block, /^vertical: web$/m);
+	assert.match(block, /^query: hello world$/m, "a plain string needs no quotes: that is where the tokens are");
+	assert.match(block, /^results\[2\]\{rank,title,url,snippet,source\}:$/m, "the size and the field list are declared once");
+	assert.match(block, /^  1,First,"https:\/\/a\.test\/1","alpha, with a comma",a\.test$/m);
+	assert.match(block, /^  2,Second,"https:\/\/b\.test\/2",beta,b\.test$/m);
+});
+
+test("toon quotes only what the format would otherwise misread", () => {
+	const block = toonBlock(
+		normalizeItems([
+			{ rank: 1, title: "42", link: "https://a.test/1", snippet: 'He said "go"', domain: "a.test" },
+			{ rank: 2, title: "- not a list marker", link: "https://b.test/2", snippet: "true", domain: "b.test" },
+		]),
+	);
+
+	assert.match(block, /"42",/, "a numeric-looking title stays a string");
+	assert.match(block, /"He said \\"go\\""/, "quotes escape, so a cell cannot end the row early");
+	assert.match(block, /"- not a list marker"/, "a leading hyphen would read as a list item");
+	assert.match(block, /"true"/, "a snippet that says true stays a string");
+});
+
+test("toon drops columns no result has, and rows without a value stay empty", () => {
+	const block = toonBlock(
+		normalizeItems([
+			{ rank: 1, title: "Only title", link: "https://a.test/1" },
+			{ rank: 2, title: "With a price", link: "https://b.test/2", price: "$9.99" },
+		]),
+	);
+
+	assert.match(block, /results\[2\]\{rank,title,url,source,price\}:/, "snippet is empty in every row, so the column is gone");
+	assert.match(block, /^  1,Only title,"https:\/\/a\.test\/1",a\.test,$/m, "a missing cell is an empty cell");
+	assert.match(block, /^  2,With a price,"https:\/\/b\.test\/2",b\.test,\$9\.99$/m);
+});
+
+test("toon is smaller than the same results as JSON and as the text list", () => {
+	const items = normalizeItems(
+		Array.from({ length: 10 }, (_unused, index) => ({
+			rank: index + 1,
+			title: `Result ${index + 1}: something about a topic`,
+			link: `https://site-${index + 1}.example.org/path/to/page-${index + 1}`,
+			snippet: `A snippet of roughly eighty characters, mentioning v1.${index} released in 202${index}, with a comma and a quote.`,
+			domain: `site-${index + 1}.example.org`,
+		})),
+	);
+	const full = response(items);
+	const toon = formatResults(full, { budgetChars: 6000, includeCitations: false, toon: true });
+	const text = formatResults(full, { budgetChars: 6000, includeCitations: false });
+	const json = JSON.stringify({ items }, null, 1);
+
+	assert.ok(toon.length < json.length, `toon ${toon.length} must beat json ${json.length}`);
+	assert.ok(toon.length < text.length, `toon ${toon.length} must beat the text list ${text.length}`);
+});
+
+test("toon says so when there is nothing to show", () => {
+	const block = toonBlock([], { raw: { keys: [], first: undefined, total: 0 } });
+	assert.match(block, /showing: 0/);
+	assert.match(block, /results\[0]:\n\(no results\)/);
+});
+
+test("the grounding preamble is kept in TOON mode, the budget still clips", () => {
+	const items = normalizeItems([{ rank: 1, title: "One", link: "https://a.test/1", snippet: "x" }]);
+	const withRules = formatResults(response(items), { budgetChars: 6000, includeCitations: true, toon: true });
+	assert.match(withRules, /\nresults\[1\]\{/m);
+	assert.match(withRules, /Cite inline as \[n\]/, "the table is the payload, not the instructions");
+
+	const clipped = formatResults(response(items), { budgetChars: 1, includeCitations: false, toon: true });
+	assert.match(clipped, /\nresults\[1\]\{/, "the block stays TOON when the budget forces one item");
+});
+
+test("a TOON body from the endpoint is handed over without re-encoding", () => {
+	const verbatim = "results[2]{a,b}:\n  1,x\n  2,y";
+	const items = normalizeItems([{ rank: 1, title: "One", link: "https://a.test/1", snippet: "x" }]);
+	const block = formatResults(response(items, { toonText: verbatim }), { budgetChars: 6000, includeCitations: false, toon: true });
+	assert.equal(block, verbatim, "exactly as it returned, not a re-render of our parse");
+});
+
 test("the images block reports the file, the page and the size", () => {
 	const block = formatResults(
 		response(

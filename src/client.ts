@@ -80,6 +80,17 @@ export interface SearchResponse {
 	account: SearchAccount;
 	/** Diagnostics for /searlo raw. */
 	raw: { keys: string[]; first: unknown; total: number };
+	/**
+	 * TOON exactly as the endpoint returned it, when the body was TOON text rather than JSON.
+	 * Searlo's REST search endpoints answer JSON even with format=toon, so this is normally unset and
+	 * format.ts renders the TOON itself from the parsed items.
+	 */
+	toonText?: string;
+}
+
+/** How many results a response carries, whichever shape they arrived in: JSON items or TOON text. */
+export function resultCount(response: SearchResponse): number {
+	return response.items.length || response.raw.total;
 }
 
 export type SearloErrorKind =
@@ -281,6 +292,8 @@ export function buildSearchUrl(
 	for (const [key, value] of Object.entries(settings.params)) {
 		if (!url.searchParams.has(key)) url.searchParams.set(key, value);
 	}
+	// Set last, so an explicit `params.format` still wins: Searlo also documents `enhanced`.
+	if (settings.toon && !url.searchParams.has("format")) url.searchParams.set("format", "toon");
 	return url.toString();
 }
 
@@ -322,11 +335,28 @@ export async function search(settings: SearloSettings, query: string, options: S
 
 	const parsed = parseJson(text);
 	if (!parsed.parsed) {
-		const head = text.trimStart().slice(0, 40);
-		throw new SearloError(
-			"shape",
-			`expected JSON from ${settings.baseUrl}${endpointFor(settings, vertical)}, got ${head.startsWith("<") ? "HTML" : "non-JSON"}: ${excerpt(text)}`,
-		);
+		// A server that honours format=toon answers TOON text, not JSON. Hand it to the model exactly
+		// as it arrived instead of reporting a shape failure: that text is the point of the option.
+		const toon = settings.toon ? asToonText(text) : undefined;
+		if (!toon) {
+			const head = text.trimStart().slice(0, 40);
+			throw new SearloError(
+				"shape",
+				`expected JSON from ${settings.baseUrl}${endpointFor(settings, vertical)}, got ${head.startsWith("<") ? "HTML" : "non-JSON"}: ${excerpt(text)}`,
+			);
+		}
+		return {
+			query: trimmed,
+			vertical,
+			url,
+			status: response.status,
+			elapsedMs,
+			items: [],
+			information: readInformation({}),
+			account: readAccount(response.headers),
+			raw: { keys: [], first: toon.head, total: toon.rows },
+			toonText: toon.text,
+		};
 	}
 	const payload = parsed.value;
 
@@ -353,6 +383,26 @@ export async function search(settings: SearloSettings, query: string, options: S
 }
 
 type JsonPayload = { parsed: true; value: object | null } | { parsed: false };
+
+/**
+ * A TOON array header: `results[2]{rank,title}:`, `items[0]:`, a root `[3]:`, or the same on a
+ * list-item line (`- users[2]{id}:`). Requiring it is what keeps a plain-text upstream error —
+ * `error: rate limited` reads as a TOON field line — from being served to the model as a result.
+ */
+const TOON_ARRAY_HEADER = /^[ \t]*(?:-[ \t]*)?(?:[A-Za-z_][\w.-]*)?\[(\d+)\](?:\{[^}\n]*\})?:[ \t]*$/m;
+
+/**
+ * Accepts a body only if it reads as a TOON document: not HTML, not empty, and carrying an array
+ * header. That header is also where the row count comes from, since the rows themselves stay in the
+ * text the model reads. Anything else is left to the caller's `shape` error.
+ */
+function asToonText(text: string): { text: string; head: string; rows: number } | undefined {
+	const body = text.trim();
+	if (!body || body.startsWith("<") || body.startsWith("{")) return undefined;
+	const header = TOON_ARRAY_HEADER.exec(body);
+	if (!header) return undefined;
+	return { text: body, head: body.slice(0, 240), rows: Number(header[1]) };
+}
 
 function parseJson(text: string): JsonPayload {
 	try {

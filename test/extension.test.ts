@@ -19,6 +19,15 @@ const PAYLOAD = JSON.stringify({
 	items: [{ rank: 1, title: "Fresh result", link: "https://a.test/1", snippet: "happened yesterday", domain: "a.test" }],
 });
 
+/** What an endpoint that honours `format=toon` answers: text, not JSON. Asked for with q=…toontext… */
+const TOON_PAYLOAD = [
+	"vertical: web",
+	"query: toontext",
+	"results[2]{rank,title,url,snippet}:",
+	'  1,Alpha result,"https://a.test/1",alpha snippet',
+	'  2,Beta result,"https://b.test/2",beta snippet',
+].join("\n");
+
 interface Stub {
 	tools: any[];
 	commands: Record<string, any>;
@@ -110,6 +119,18 @@ let requests: string[] = [];
 test.before(async () => {
 	server = createServer((req, res) => {
 		requests.push(req.url ?? "");
+		const asked = new URL(req.url ?? "/", "http://mock").searchParams.get("q") ?? "";
+		// One query word selects the text answer, so the JSON tests keep their payload.
+		if (asked.includes("toontext")) {
+			res.writeHead(200, {
+				"content-type": "text/plain; charset=utf-8",
+				"x-cache": "MISS",
+				"x-credits-deducted": "1",
+				"x-credits-remaining": "42",
+			});
+			res.end(TOON_PAYLOAD);
+			return;
+		}
 		res.writeHead(200, {
 			"content-type": "application/json",
 			"x-cache": "MISS",
@@ -479,6 +500,27 @@ test("auto mode injects a context message before the run only for time-sensitive
 	}
 });
 
+test("auto injection keeps a TOON text body instead of dropping it", async () => {
+	useConfig({ mode: "auto", toon: true });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+
+		const injected = await fire(stub, "before_agent_start", {
+			messageType: "user",
+			prompt: "what is the latest toontext release today",
+		});
+
+		// items is empty for a text body, so this used to look like "no results" and inject nothing.
+		assert.equal(injected[0]?.message?.customType, "searlo:context", "the search happened, so it must be injected");
+		assert.match(injected[0].message.content, /results\[2\]\{rank,title,url,snippet\}:/, "the endpoint's own TOON, verbatim");
+		assert.equal(injected[0].message.details.count, 2, "the row count comes from the [N] header, not from items");
+	} finally {
+		cleanup();
+	}
+});
+
 test("a failing search does not block the user's turn", async () => {
 	useConfig({ mode: "auto", baseUrl: "http://127.0.0.1:1", timeoutMs: 1000 });
 	try {
@@ -696,6 +738,123 @@ test("one query costs one request per turn", async () => {
 		await fire(stub, "agent_end", {});
 		await stub.tools[0].execute("tc2", { query: prompt.prompt }, undefined, undefined, { cwd: process.cwd() });
 		assert.equal(requests.length, 2, "a new turn may search again");
+	} finally {
+		cleanup();
+	}
+});
+
+test("/searlo toon switches the model-facing block to a TOON table", async () => {
+	useConfig({ mode: "tool" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+
+		const asText = await stub.tools[0].execute("tc1", { query: "the latest release today" }, undefined, undefined, { cwd: process.cwd() });
+		assert.match(asText.content[0].text, /<searlo_results/, "default rendering is the readable list");
+
+		await stub.commands["searlo"].handler("toon on", stub.ctx);
+		const asToon = await stub.tools[0].execute("tc2", { query: "the latest release today" }, undefined, undefined, { cwd: process.cwd() });
+		assert.match(asToon.content[0].text, /\nresults\[1\]\{rank,title,url,snippet,source\}:$/m, "the toggle reaches the tool");
+		assert.doesNotMatch(asToon.content[0].text, /<searlo_results/);
+		assert.match(asToon.content[0].text, /Cite inline as \[n\]/, "the grounding rules survive the format change");
+		assert.equal(asToon.details.count, 1, "the count comes from the parsed items");
+		assert.doesNotMatch(asToon.content[0].text, /sk_wired_key_1234/, "the key stays out of the table too");
+
+		// A different rendering is a different request (format=toon), so it must not hit the same cache slot.
+		assert.equal(requests.length, 2, "text and toon are not the same cached search");
+		assert.doesNotMatch(requests[0], /format=/, "the first call was made before the toggle");
+		assert.match(requests[1], /format=toon/, "the request asks for toon once the option is on");
+
+		assert.equal(stub.status["searlo"], "Searlo: Web · toon", "the footer says which rendering is live");
+
+		await stub.commands["searlo"].handler("toon off", stub.ctx);
+		const backToText = await stub.tools[0].execute("tc3", { query: "the latest release today" }, undefined, undefined, { cwd: process.cwd() });
+		assert.match(backToText.content[0].text, /<searlo_results/);
+	} finally {
+		cleanup();
+	}
+});
+
+test("searlo.json can turn TOON on by default, and /searlo toon --save persists it", async () => {
+	useConfig({ mode: "tool", toon: true });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+
+		const first = await stub.tools[0].execute("tc1", { query: "the latest release today" }, undefined, undefined, { cwd: process.cwd() });
+		assert.match(first.content[0].text, /\nresults\[1\]\{/, "the file default reaches the very first search");
+
+		await stub.commands["searlo"].handler("toon off --save", stub.ctx);
+		const stored = JSON.parse(readFileSync(join(agentDir, "searlo.json"), "utf8")) as Record<string, unknown>;
+		assert.equal(stored["toon"], false, "--save writes the file");
+		assert.equal(stored["apiKey"], "sk_wired_key_1234", "saving the format keeps the key");
+		assert.match(stub.notifications.at(-1)!.message, /saved in/);
+		assert.doesNotMatch(stub.notifications.map((note) => note.message).join(" "), /sk_wired_key_1234/);
+	} finally {
+		cleanup();
+	}
+});
+
+test("/searlo config reports the output format and /searlo toon junk asks for usage", async () => {
+	useConfig({ mode: "tool" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+
+		await stub.commands["searlo"].handler("config", stub.ctx);
+		assert.match(stub.notifications.at(-1)!.message, /output: text \(text list\)/);
+
+		await stub.commands["searlo"].handler("toon nonsense", stub.ctx);
+		assert.match(stub.notifications.at(-1)!.message, /usage: \/searlo toon \[on\|off\]/);
+	} finally {
+		cleanup();
+	}
+});
+
+test("auto injection and /searlo <query> both honour the format", async () => {
+	useConfig({ mode: "auto" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+		await stub.commands["searlo"].handler("toon", stub.ctx);
+
+		const injected = await fire(stub, "before_agent_start", {
+			messageType: "user",
+			prompt: "what is the latest node lts release today",
+		});
+		assert.match(injected[0]?.message?.content ?? "", /\nresults\[1\]\{/, "the hidden context block is TOON too");
+
+		await stub.commands["searlo"].handler("latest release notes", stub.ctx);
+		assert.match(stub.sentUserMessages[0] ?? "", /\nresults\[1\]\{/, "/searlo <query> renders the same way");
+	} finally {
+		cleanup();
+	}
+});
+
+test("the picker switches the output format without touching the mode", async () => {
+	useConfig({ mode: "tool" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+		const binding = stub.handlers["shortcut:f3"][0];
+
+		stub.selectQueue = ["◆  Change output format…", "○ TOON (header line, then one row per result)"];
+		await binding(stub.ctx);
+		assert.deepEqual(stub.active, ["read", "bash", "searlo_search"], "the mode is untouched");
+
+		const result = await stub.tools[0].execute("tc1", { query: "the latest release today" }, undefined, undefined, { cwd: process.cwd() });
+		assert.match(result.content[0].text, /\nresults\[1\]\{/, "the picker choice reaches the next search");
+
+		const before = stub.notifications.length;
+		stub.selectQueue = ["◆  Change output format…", "● TOON (header line, then one row per result)"];
+		await binding(stub.ctx);
+		assert.equal(stub.notifications.length, before, "re-picking the format you already have changes nothing");
+		assert.match(stub.notifications.at(-1)!.message, /searlo output: toon \(this session\)/, "the first choice was confirmed truthfully");
 	} finally {
 		cleanup();
 	}

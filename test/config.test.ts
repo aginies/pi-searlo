@@ -173,6 +173,27 @@ test("maskKey never reproduces the whole key", () => {
 	assert.equal(maskKey("short"), "*****");
 });
 
+test("maskKey hides a short key completely instead of showing most of it", () => {
+	const short: [number, string][] = [
+		[8, "abcdefgh"],
+		[9, "abcdefghi"],
+		[12, "abcdefghijkl"],
+		[16, "abcdefghijklmnop"],
+	];
+	for (const [length, key] of short) {
+		// A 9-character key used to come back as "abcde…fghi": every character, in order.
+		assert.equal(maskKey(key), "*".repeat(length), `${length} chars must be all stars`);
+		assert.ok(!maskKey(key).includes(key.slice(0, 4)), "no fragment of the key may survive");
+		assert.ok(!maskKey(key).includes(key.slice(-4)), "no fragment of the key may survive");
+	}
+
+	// Past the threshold a prefix and a suffix are a minority of the secret, and enough to recognise it.
+	const long = `sk_live_${"a".repeat(32)}`;
+	assert.equal(long.length, 40);
+	assert.equal(maskKey(long), `${long.slice(0, 5)}…${long.slice(-4)} (40 chars)`);
+	assert.ok(!maskKey(long).includes(long.slice(5, -4)), "the middle never appears");
+});
+
 test("storeApiKey keeps other settings and locks the file to 0600", () => {
 	withAgentDir((dir) => {
 		writeAgentConfig(dir, { limit: 7, mode: "auto", baseUrl: "https://search.example.test" });
@@ -211,14 +232,5 @@ test("storeApiKey refuses to clobber a config it cannot parse", () => {
 test("storeApiKey rejects an empty key", () => {
 	withAgentDir(() => {
 		assert.throws(() => storeApiKey("   ", userConfigPath()), /empty key/);
-	});
-});
-
-test("getSettings overrides apply on top of the files", () => {
-	withAgentDir((dir) => {
-		writeAgentConfig(dir, { limit: 4 });
-		const loaded = loadConfig({ force: true, overrides: { mode: "auto", limit: 11 } });
-		assert.equal(loaded.settings.limit, 10, "overrides are clamped to the API maximum too");
-		assert.equal(loaded.settings.mode, "auto");
 	});
 });

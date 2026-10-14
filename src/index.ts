@@ -8,6 +8,9 @@
  *   M2  searlo_search     a tool the model calls whenever it needs fresh data
  *   M3  mode "auto"       best-effort retrieval before a run starts (opt-in)
  *
+ * `toon` is orthogonal to all three: it changes what the model reads (a TOON table instead of a
+ * text list) and sends `format=toon` on the wire, never whether a search runs at all.
+ *
  * `mode` gates all three: "manual" keeps M1 only, and "off" refuses M1 as well, so nothing is sent
  * and nothing is billed. `runSearch` is the single place that decides, which is what makes "off" total.
  */
@@ -34,8 +37,8 @@ import {
 	type SearloMode,
 	type SearloSettings,
 } from "./config.ts";
-import { SearloError, search, type SearchResponse } from "./client.ts";
-import { CONTEXT_TYPE, formatError, formatResults, summarize } from "./format.ts";
+import { SearloError, resultCount, search, type SearchResponse } from "./client.ts";
+import { CONTEXT_TYPE, describeRaw, formatError, formatResults, summarize } from "./format.ts";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const TOOL_NAME = "searlo_search";
@@ -76,7 +79,9 @@ function offMessage(settings: SearloSettings): string {
 /** The text shown in the bottom bar, or undefined to show nothing. */
 function statusText(state: Session): string | undefined {
 	if (!state.settings.showStatus || !toolEnabled(state.settings.mode)) return undefined;
-	return `Searlo: ${VERTICAL_STATUS[activeVertical(state)]}`;
+	// The format is visible because it is invisible to the model: you cannot tell a TOON block
+	// from a text list without looking at a tool result.
+	return `Searlo: ${VERTICAL_STATUS[state.settings.vertical]}${state.settings.toon ? " · toon" : ""}`;
 }
 
 function updateStatus(ctx: ExtensionContext): void {
@@ -111,6 +116,12 @@ let modeOverride: SearloMode | undefined;
 /** Vertical chosen with /searlo vertical <name> or the picker, for this session only. */
 let verticalOverride: SearchVertical | undefined;
 
+/**
+ * TOON on or off, chosen with /searlo toon or the picker, for this session only. `undefined` means
+ * "follow the file", which is why this is a boolean or nothing rather than a default true.
+ */
+let toonOverride: boolean | undefined;
+
 /** query|limit|page -> response, so one turn never pays for the same search twice. */
 const turnCache = new Map<string, SearchResponse>();
 
@@ -121,6 +132,7 @@ function refreshConfig(cwd?: string, force = false): Session {
 	const settings: SearloSettings = { ...loaded.settings };
 	if (modeOverride) settings.mode = modeOverride;
 	if (verticalOverride) settings.vertical = verticalOverride;
+	if (toonOverride !== undefined) settings.toon = toonOverride;
 	const local = resolveKeyFromLocal(settings);
 	const key: ResolvedKey = local.key ? local : storedCredentialKey() ?? { ...local, source: "none" as const };
 	session = { settings, key, sources: loaded.sources, toolActive: toolEnabled(settings.mode) };
@@ -182,9 +194,11 @@ async function runSearch(
 	if (searchForbidden(state.settings.mode)) throw new SearloError("disabled", offMessage(state.settings));
 	const limit = options.limit ?? state.settings.limit;
 	const page = options.page ?? state.settings.page ?? 1;
-	const vertical = options.vertical ?? activeVertical(state);
-	// Same words, different vertical: must not share a cache entry.
-	const cacheKey = `${vertical}|${limit}|${page}|${query.trim().toLowerCase()}`;
+	// refreshConfig already folded verticalOverride into settings, so this is the effective vertical.
+	const vertical = options.vertical ?? state.settings.vertical;
+	// Same words, different vertical or output format: must not share a cache entry, because the
+	// request itself changes when format=toon is on the wire.
+	const cacheKey = `${vertical}|${limit}|${page}|${state.settings.toon ? "toon" : "text"}|${query.trim().toLowerCase()}`;
 	const cached = turnCache.get(cacheKey);
 	if (cached) return cached;
 
@@ -200,6 +214,7 @@ function contextBlock(response: SearchResponse, state: Session): string {
 	return formatResults(response, {
 		budgetChars: state.settings.contentBudgetChars,
 		includeCitations: state.settings.includeCitations,
+		toon: state.settings.toon,
 	});
 }
 
@@ -252,7 +267,7 @@ const searchTool = defineTool({
 			details: {
 				query: response.query,
 				vertical: response.vertical,
-				count: response.items.length,
+				count: resultCount(response),
 				elapsedMs: response.elapsedMs,
 				information: response.information,
 				account: response.account,
@@ -262,11 +277,6 @@ const searchTool = defineTool({
 	},
 });
 
-/** The vertical a search would use right now. */
-function activeVertical(state: Session): SearchVertical {
-	return verticalOverride ?? state.settings.vertical;
-}
-
 /** Vertical with its origin, for the status line and the picker. */
 function describeVertical(state: Session): string {
 	const configured = state.settings.vertical;
@@ -275,9 +285,31 @@ function describeVertical(state: Session): string {
 	return `${verticalOverride} (this session; config says ${configured})`;
 }
 
+/** What the model gets handed: the readable line list, or a TOON table that costs fewer tokens. */
+const OUTPUT_CHOICES: { toon: boolean; label: string; effect: string }[] = [
+	{ toon: false, label: "Text (one line per result)", effect: "readable list with [n] markers" },
+	{ toon: true, label: "TOON (header line, then one row per result)", effect: "same data in fewer tokens" },
+];
+
+/** The rendering a search would use right now, for the status line and the picker. */
+function outputLabel(state: Session): string {
+	return state.settings.toon ? "toon" : "text";
+}
+
+/** `/searlo toon on|off`, and the synonyms a user is likely to try first. */
+const TOON_WORDS = new Map<string, boolean>([
+	["on", true],
+	["toon", true],
+	["true", true],
+	["off", false],
+	["text", false],
+	["json", false],
+	["false", false],
+]);
+
 /**
- * The F3 picker: mode first, then search type. Marking the current choice in the label is what
- * makes the dialog answer "which one is selected" without a second screen.
+ * The F3 picker: mode, then search type, then how the results are rendered. Marking the current
+ * choice in the label is what makes the dialog answer "which one is selected" without a second screen.
  */
 async function openPicker(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
 	if (!ctx.hasUI) {
@@ -286,13 +318,30 @@ async function openPicker(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void
 	}
 	const state = refreshConfig(ctx.cwd, true);
 	const current = state.settings.mode;
-	const vertical = activeVertical(state);
+	const vertical = state.settings.vertical;
 
 	const choice = await ctx.ui.select("Searlo", [
 		...MODE_CHOICES.map(({ mode, label }) => `${mode === current ? "●" : "○"} ${label}`),
 		"◆  Change search type…",
+		"◆  Change output format…",
 	]);
 	if (!choice) return;
+
+	if (choice.startsWith("◆") && choice.includes("format")) {
+		const picked = await ctx.ui.select(
+			`Searlo output (currently ${outputLabel(state)})`,
+			OUTPUT_CHOICES.map(({ toon, label }) => `${toon === state.settings.toon ? "●" : "○"} ${label}`),
+		);
+		if (!picked) return;
+		const next = OUTPUT_CHOICES.find(({ label }) => picked === `● ${label}` || picked === `○ ${label}`);
+		if (!next || next.toon === state.settings.toon) return;
+		toonOverride = next.toon;
+		// Label the refreshed session, not the `state` captured before the choice: the old one still
+		// says "text" after you pick TOON, which is a very confusing way to confirm a change.
+		ctx.ui.notify(`searlo output: ${outputLabel(refreshConfig(ctx.cwd, true))} (this session) — ${next.effect}`, "info");
+		updateStatus(ctx);
+		return;
+	}
 
 	if (choice.startsWith("◆")) {
 		const picked = await ctx.ui.select(
@@ -391,16 +440,46 @@ async function handleSearloArgs(args: string, pi: ExtensionAPI, ctx: ExtensionCo
 		if (searchForbidden(state.settings.mode)) return notifyOff(state, ctx);
 		const target = splitVertical(rest);
 		const query = target.query || "hello world";
-		ctx.ui.notify(`searlo: searching “${query}” (${target.vertical ?? activeVertical(state)})…`, "info");
+		ctx.ui.notify(`searlo: searching “${query}” (${target.vertical ?? state.settings.vertical})…`, "info");
 		try {
 			const response = await runSearch(state, query, { vertical: target.vertical, limit: target.vertical ? undefined : state.settings.limit });
 			ctx.ui.notify(`searlo ok — ${summarize(response)} · key ${describeKey(state)}`, "info");
-			if (response.items.length === 0) {
+			if (resultCount(response) === 0) {
 				ctx.ui.notify("searlo returned no items; check the query and configured params", "warning");
 			}
 		} catch (error) {
 			ctx.ui.notify(`searlo failed: ${formatError(error)}`, "error");
 		}
+		return;
+	}
+
+	if (sub === "toon" || sub === "output") {
+		const ask = rest[0]?.toLowerCase();
+		const wanted = TOON_WORDS.get(ask ?? "");
+		if (ask && wanted === undefined) {
+			ctx.ui.notify("usage: /searlo toon [on|off] [--save]", "warning");
+			return;
+		}
+		// Bare `/searlo toon` flips whatever is in effect, session override included.
+		const next = wanted ?? !state.settings.toon;
+		if (rest.includes("--save")) {
+			try {
+				const stored = setConfigValue("toon", next);
+				toonOverride = undefined;
+				refreshConfig(ctx.cwd, true);
+				ctx.ui.notify(`searlo: output "${next ? "toon" : "text"}" saved in ${stored.path}`, "info");
+				return;
+			} catch (error) {
+				ctx.ui.notify(`searlo could not save the output format: ${formatError(error)}`, "error");
+				return;
+			}
+		}
+		toonOverride = next;
+		ctx.ui.notify(
+			`searlo output: ${outputLabel(refreshConfig(ctx.cwd, true))} (this session) — ${next ? "a TOON table: one header line, then one row per result, in fewer tokens" : "the readable line list"}`,
+			"info",
+		);
+		updateStatus(ctx);
 		return;
 	}
 
@@ -454,6 +533,7 @@ async function handleSearloArgs(args: string, pi: ExtensionAPI, ctx: ExtensionCo
 			`vertical: ${describeVertical(state)}`,
 			`apiKeyHeader: ${state.settings.apiKeyHeader} · limit: ${state.settings.limit} · timeout: ${state.settings.timeoutMs}ms`,
 			`mode: ${describeMode(state)}`,
+			`output: ${outputLabel(state)} (${state.settings.toon ? "TOON table, format=toon sent" : "text list"})`,
 			`shortcut: ${state.settings.shortcut} · status bar: ${state.settings.showStatus ? "on when enabled" : "off"}`,
 			`key: ${describeKey(state)}`,
 		];
@@ -473,10 +553,8 @@ async function handleSearloArgs(args: string, pi: ExtensionAPI, ctx: ExtensionCo
 		const query = target.query || "hello world";
 		try {
 			const response = await runSearch(state, query, { vertical: target.vertical });
-			ctx.ui.notify(
-				`searlo raw ${response.vertical} item keys: ${response.raw.keys.join(", ") || "(none)"} · total ${response.raw.total}`,
-				"info",
-			);
+			// A TOON body arrives as text, so there are no item keys to report: show its head instead.
+			ctx.ui.notify(`searlo raw ${response.vertical} ${describeRaw(response)}`, "info");
 		} catch (error) {
 			ctx.ui.notify(`searlo failed: ${formatError(error)}`, "error");
 		}
@@ -490,8 +568,8 @@ async function handleSearloArgs(args: string, pi: ExtensionAPI, ctx: ExtensionCo
 	if (!query) {
 		ctx.ui.notify(
 			[
-				`mode: ${state.settings.mode} · vertical: ${activeVertical(state)} · key: ${state.key.key ? describeKey(state) : "not configured"}`,
-				`/searlo <query> · /searlo ${VERTICAL_NAMES.join("|")}: <query> · /searlo off|manual|on|auto · /searlo vertical <name> · /searlo test · /searlo config`,
+				`mode: ${state.settings.mode} · vertical: ${state.settings.vertical} · key: ${state.key.key ? describeKey(state) : "not configured"}`,
+				`/searlo <query> · /searlo ${VERTICAL_NAMES.join("|")}: <query> · /searlo off|manual|on|auto · /searlo toon on|off · /searlo vertical <name> · /searlo test · /searlo config`,
 			].join("\n"),
 			"info",
 		);
@@ -500,7 +578,7 @@ async function handleSearloArgs(args: string, pi: ExtensionAPI, ctx: ExtensionCo
 
 	try {
 		const response = await runSearch(state, query, { vertical: target.vertical });
-		if (response.items.length === 0) {
+		if (resultCount(response) === 0) {
 			ctx.ui.notify(`searlo found nothing for “${query}”`, "warning");
 			return;
 		}
@@ -538,9 +616,9 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("searlo", {
-		description: `Search the web via Searlo: /searlo <query> | images:\u003cquery> | off | manual | on | auto | vertical <name> | test | login | config | init (${binding} opens the picker)`,
+		description: `Search the web via Searlo: /searlo <query> | images:\u003cquery> | off | manual | on | auto | toon on|off | vertical <name> | test | login | config | init (${binding} opens the picker)`,
 		getArgumentCompletions: (prefix) => {
-			const words = ["off", "manual", "on", "auto", "test", "config", "login", "init", "raw", "vertical", "default", ...VERTICAL_NAMES];
+			const words = ["off", "manual", "on", "auto", "toon", "test", "config", "login", "init", "raw", "vertical", "default", ...VERTICAL_NAMES];
 			const head = prefix.trim();
 			const hits = words.filter((word) => word.startsWith(head));
 			return hits.length ? hits.map((label) => ({ value: `${label} `, label })) : null;
@@ -554,6 +632,7 @@ export default function (pi: ExtensionAPI) {
 		// A new session starts from the file again; the previous session's toggles are not carried over.
 		modeOverride = undefined;
 		verticalOverride = undefined;
+		toonOverride = undefined;
 		turnCache.clear();
 		const state = refreshConfig(ctx.cwd);
 		syncTools(pi);
@@ -585,13 +664,15 @@ export default function (pi: ExtensionAPI) {
 
 		try {
 			const response = await runSearch(state, event.prompt, { signal: ctx.signal });
-			if (response.items.length === 0) return;
+			// resultCount, not items.length: a body that arrived as TOON text carries rows and no items,
+			// so testing the array alone would silently throw a successful search away.
+			if (resultCount(response) === 0) return;
 			return {
 				message: {
 					customType: CONTEXT_TYPE,
 					content: contextBlock(response, state),
 					display: false,
-					details: { query: response.query, count: response.items.length },
+					details: { query: response.query, count: resultCount(response) },
 				},
 			};
 		} catch (error) {

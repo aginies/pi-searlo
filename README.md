@@ -34,6 +34,7 @@ pi package install <your-scope>/pi-searlo
 	"limit": 5,
 	"timeoutMs": 8000,
 	"mode": "tool",
+	"toon": false,
 	"shortcut": "f3",
 	"showStatus": true,
 	"params": { "gl": "us", "hl": "en" }
@@ -51,7 +52,7 @@ It deliberately does **not** accept the key as a command argument: pi records co
 the session transcript, and sessions get exported, shared and compacted. The key never appears in
 model-facing text, tool results, notifications, or logs.
 
-A project `.pi/searlo.json` may tune `baseUrl`, `limit`, `params`, `mode` and budgets, but its
+A project `.pi/searlo.json` may tune `baseUrl`, `limit`, `params`, `mode`, `toon` and budgets, but its
 `apiKey`, `apiKeyEnv` and `apiKeyHeader` fields are ignored — a repository you clone cannot redirect
 your credentials or swap in its own key header.
 
@@ -99,6 +100,7 @@ Searlo
 ○ Manual (only /searlo searches)
 ○ Off (no Searlo searches)
 ◆  Change search type…          → web | images | news | videos | shopping
+◆  Change output format…        → text | toon
 ```
 
 Choosing `Off` is the same as `/searlo off`. While the model may search, the built-in footer shows
@@ -171,6 +173,7 @@ reported as a warning and the turn continues unsearched — auto mode never bloc
 /searlo <vertical>: <query>  one shot in that vertical: web|images|news|videos|shopping
 /searlo auto|on|manual|off  per-session toggle: injection / model tool / hand-run only / nothing
 /searlo default <mode>    persist off|manual|tool|auto into searlo.json for new sessions
+/searlo toon [on|off] [--save]  hand the model a TOON table instead of the text list
 /searlo vertical <name> [--save]  search type for this session, or persisted with --save
 /searlo test [query]      one search, with latency, cache HIT/MISS and credits remaining
 /searlo raw [query]       print the field names of the first raw item (shape diagnosis)
@@ -198,6 +201,52 @@ Grounding rules for the block above:
 ```
 
 Full structured results stay in the tool `details`, out of model context.
+
+### TOON output (`"toon": true`)
+
+Searlo documents TOON (Token-Oriented Object Notation) as a compact tabular rendering of the same
+results — one header line declaring the columns, then one row per result. Turn it on and pi-searlo
+asks for it (`format=toon` on the wire) and hands the model a table instead of the list above:
+
+```text
+vertical: web
+query: latest node lts release
+retrieved_utc: "2026-10-14 12:41"
+showing: 2
+total_results: "2670000"
+page: 1
+next_page_available: true
+results[2]{rank,title,url,snippet,source}:
+  1,Node.js Releases,"https://nodejs.org/en/about/previous-releases","Starting with Node.js 27, the cycle is annual.",nodejs.org
+  2,Node.js | endoflife.date,"https://endoflife.date/nodejs",22 ( LTS ) released 2 years ago,endoflife.date
+```
+
+Cell quoting follows the TOON rules: a value is quoted only when an unquoted one would misread (a
+comma, colon, quote, bracket, a leading `-` or `#`, or something that looks like a number). Columns
+that no result fills are dropped, so the header stays narrow; a missing cell is an empty cell. The
+`<searlo_results>` wrapper disappears in this mode, and the grounding rules still follow the table —
+they are what makes the model cite the rows instead of inventing them.
+
+Measure it honestly on a 10-result web search: the table is about 19 % smaller than the same items
+as JSON, and about 3 % smaller than the default list, because snippets dominate either way. So
+enable it when you want the format Searlo itself documents, or when your own tooling reads TOON —
+not for a dramatic token drop.
+
+| Scope | How |
+|---|---|
+| Every new session | `"toon": true` in `~/.pi/agent/searlo.json` |
+| This session only | `/searlo toon` (toggle), `/searlo toon on\|off`, or the `◆ Change output format…` line in the picker |
+| Persistent from inside pi | `/searlo toon on --save` |
+
+The footer marks the live rendering — `Searlo: Web · toon` — because a TOON block and a text block
+are indistinguishable from the outside until you look at a tool result.
+
+The REST search endpoints answer JSON today even when asked for TOON (verified with `format=toon`
+and `Accept: text/toon` against `api.searlo.tech`), so the table above is rendered here from the
+parsed results. If an endpoint does answer TOON text, that text is passed to the model exactly as it
+arrived, with no re-encoding and no `shape` error — `/searlo raw <query>` then prints the row count
+and the head of the document. An explicit `"params": { "format": "enhanced" }` still wins over the
+`toon` option.
 
 ## Failure behaviour
 

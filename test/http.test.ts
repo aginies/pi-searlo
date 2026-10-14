@@ -3,7 +3,7 @@ import { createServer, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, before, test } from "node:test";
 
-import { SearloError, search, buildSearchUrl } from "../src/client.ts";
+import { resultCount, SearloError, search, buildSearchUrl } from "../src/client.ts";
 import { DEFAULT_SETTINGS, type SearloSettings } from "../src/config.ts";
 
 /** Query strings that select a mock behaviour, so each test drives exactly one path. */
@@ -16,7 +16,22 @@ const MODE_BY_QUERY: Record<string, string> = {
 	empty: "empty",
 	fail: "fail",
 	hang: "hang",
+	/** A server that honours format=toon answers this instead of JSON. */
+	toon: "toon",
+	/** Plain text that merely looks like TOON: an upstream error, and a fields-only document. */
+	texterror: "texterror",
+	toonfields: "toonfields",
 };
+
+/** The body a TOON-honouring endpoint returns: header line, then one row per result. */
+const TOON_BODY = [
+	"vertical: web",
+	"query: toon",
+	"showing: 2",
+	"results[2]{rank,title,url,snippet}:",
+	'  1,First,"https://a.test/1",alpha',
+	'  2,Second,"https://b.test/2",beta',
+].join("\n");
 
 let server: Server;
 let baseUrl: string;
@@ -60,8 +75,28 @@ function reply(mode: string, res: ServerResponse) {
 			res.writeHead(200, { "content-type": "application/json" });
 			res.end(JSON.stringify({ success: false, error: "insufficient credits" }));
 			return;
+		case "texterror":
+			// A 200 whose body is a plain-text error: `error: …` parses as a TOON field line, so
+			// accepting it would hand the model an outage notice dressed up as a search result.
+			res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+			res.end("error: rate limited\n");
+			return;
+		case "toonfields":
+			// Valid TOON fields, but no array: nothing was found, and there is no row count to trust.
+			res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+			res.end("vertical: web\nshowing: 0\n");
+			return;
 		case "hang":
 			// Never respond: the client timeout must fire.
+			return;
+		case "toon":
+			res.writeHead(200, {
+				"content-type": "text/plain; charset=utf-8",
+				"x-cache": "MISS",
+				"x-credits-deducted": "1",
+				"x-credits-remaining": "4999",
+			});
+			res.end(TOON_BODY);
 			return;
 		default:
 			res.writeHead(200, {
@@ -207,6 +242,61 @@ test("an empty result set is a success, not an error", async () => {
 	const response = await search(settings(), "empty", { key: "k" });
 	assert.deepEqual(response.items, []);
 	assert.equal(response.raw.total, 0);
+});
+
+test("toon on the wire only when the option is on", () => {
+	assert.doesNotMatch(buildSearchUrl(settings(), "q"), /format=/, "default asks for JSON");
+	assert.match(buildSearchUrl(settings({ toon: true }), "q"), /[?&]format=toon/);
+	assert.match(
+		buildSearchUrl(settings({ toon: true, params: { format: "enhanced" } }), "q"),
+		/format=enhanced/,
+		"an explicit params.format is what goes on the wire",
+	);
+	assert.doesNotMatch(buildSearchUrl(settings({ toon: true, params: { format: "enhanced" } }), "q"), /format=toon/);
+});
+
+test("a TOON body passes through exactly as it arrived", async () => {
+	const response = await search(settings({ toon: true }), "toon", { key: "k" });
+
+	assert.equal(response.toonText, TOON_BODY, "the text is not rewritten, re-indented or re-encoded");
+	assert.equal(resultCount(response), 2, "the row count comes from the [N] header");
+	assert.deepEqual(response.items, [], "nothing is decoded out of the text");
+	assert.equal(response.account.creditsRemaining, 4999, "the credit headers still apply to a text body");
+});
+
+test("a text body is still a shape error while toon is off", async () => {
+	await assert.rejects(
+		search(settings(), "toon", { key: "k" }),
+		(error) => error instanceof SearloError && error.kind === "shape",
+	);
+	// …and an HTML page is refused even when toon is on.
+	await assert.rejects(
+		search(settings({ toon: true }), "html", { key: "k" }),
+		(error) => error instanceof SearloError && error.kind === "shape",
+	);
+});
+
+test("text that only looks like TOON is still a shape error", async () => {
+	for (const query of ["texterror", "toonfields"]) {
+		await assert.rejects(
+			search(settings({ toon: true }), query, { key: "k" }),
+			(error) => error instanceof SearloError && error.kind === "shape",
+			`${query} must not be served to the model as a result`,
+		);
+	}
+
+	// …and the same bodies are refused with toon off, so the option never widens what is accepted.
+	await assert.rejects(
+		search(settings(), "texterror", { key: "k" }),
+		(error) => error instanceof SearloError && error.kind === "shape",
+	);
+});
+
+test("a JSON body with toon on still gives structured items to render from", async () => {
+	const response = await search(settings({ toon: true }), "hello world", { key: "k" });
+	assert.equal(response.toonText, undefined, "Searlo answers JSON today, so the TOON block is ours to render");
+	assert.equal(response.items.length, 2);
+	assert.match(seen.at(-1)!.url, /format=toon/);
 });
 
 test("missing key fails before any request is sent", async () => {
