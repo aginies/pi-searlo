@@ -5,7 +5,7 @@
 
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -256,6 +256,44 @@ test("/searlo off withdraws the tool and /searlo on restores it", async () => {
 
 		await stub.commands["searlo"].handler("auto", stub.ctx);
 		assert.deepEqual(stub.active, ["read", "bash", "searlo_search"]);
+	} finally {
+		cleanup();
+	}
+});
+
+test("/searlo login reads the key from the prompt, never from arguments", async () => {
+	useConfig({ mode: "tool" });
+	try {
+		const stub = makeStub();
+		stub.ctx.ui.input = async () => "sk_pasted_key_9999";
+		searloExtension(stub.pi);
+
+		await stub.commands["searlo"].handler("login sk_should_be_ignored", stub.ctx);
+
+		const path = join(agentDir, "searlo.json");
+		const stored = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+		assert.equal(stored["apiKey"], "sk_pasted_key_9999", "the prompted value is stored, not the argument");
+		assert.equal(statSync(path).mode & 0o777, 0o600);
+
+		const notes = stub.notifications.map((note) => note.message).join(" ");
+		assert.match(notes, /key saved/);
+		assert.doesNotMatch(notes, /sk_pasted_key_9999/, "status output must not echo the key");
+		assert.doesNotMatch(notes, /sk_should_be_ignored/);
+	} finally {
+		cleanup();
+	}
+});
+
+test("/searlo login with no prompt answer changes nothing", async () => {
+	useConfig({ mode: "tool" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await stub.commands["searlo"].handler("login", stub.ctx);
+
+		const stored = JSON.parse(readFileSync(join(agentDir, "searlo.json"), "utf8")) as Record<string, unknown>;
+		assert.equal(stored["apiKey"], "sk_wired_key_1234", "the existing key is untouched");
+		assert.match(stub.notifications.map((note) => note.message).join(" "), /cancelled/);
 	} finally {
 		cleanup();
 	}
