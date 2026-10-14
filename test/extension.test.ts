@@ -83,10 +83,11 @@ async function fire(stub: Stub, event: string, payload: any, ctx: any = stub.ctx
 let server: Server;
 let baseUrl: string;
 let agentDir: string;
-let requests: string[];
+let requests: string[] = [];
 
 test.before(async () => {
-	server = createServer((_req, res) => {
+	server = createServer((req, res) => {
+		requests.push(req.url ?? "");
 		res.writeHead(200, {
 			"content-type": "application/json",
 			"x-cache": "MISS",
@@ -103,6 +104,7 @@ test.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
 
 /** Writes a fresh agent dir so the extension's own config load sees our mock endpoint. */
 function useConfig(extra: Record<string, unknown> = {}) {
+	requests = [];
 	agentDir = mkdtempSync(join(tmpdir(), "pi-searlo-ext-"));
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	delete process.env.SEARLO_API_KEY;
@@ -256,6 +258,92 @@ test("/searlo off withdraws the tool and /searlo on restores it", async () => {
 
 		await stub.commands["searlo"].handler("auto", stub.ctx);
 		assert.deepEqual(stub.active, ["read", "bash", "searlo_search"]);
+	} finally {
+		cleanup();
+	}
+});
+
+test("a session mode toggle survives later /searlo commands", async () => {
+	useConfig({ mode: "tool" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+
+		await stub.commands["searlo"].handler("auto", stub.ctx);
+		// /searlo test force-reloads the config; that used to silently reset the mode back to "tool".
+		await stub.commands["searlo"].handler("test machine learning", stub.ctx);
+
+		const injected = await fire(stub, "before_agent_start", {
+			messageType: "user",
+			prompt: "what is the latest node lts release today",
+		});
+		assert.ok(injected[0]?.message, "auto mode is still active after a forced config reload");
+	} finally {
+		cleanup();
+	}
+});
+
+test("session_start resets a toggle left over from the previous session", async () => {
+	useConfig({ mode: "tool" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+		await stub.commands["searlo"].handler("auto", stub.ctx);
+
+		// Same session, new turn: still auto. Then a new session starts from the file again.
+		await fire(stub, "session_start", {});
+		const after = await fire(stub, "before_agent_start", {
+			messageType: "user",
+			prompt: "what is the latest node lts release today",
+		});
+		assert.deepEqual(after, [undefined], "the new session uses the configured mode");
+		assert.deepEqual(stub.active, ["read", "bash", "searlo_search"], "tool mode is active, injection is not");
+	} finally {
+		cleanup();
+	}
+});
+
+test("/searlo default writes the mode to the config file", async () => {
+	useConfig({ mode: "tool" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+		await stub.commands["searlo"].handler("default auto", stub.ctx);
+
+		const stored = JSON.parse(readFileSync(join(agentDir, "searlo.json"), "utf8")) as Record<string, unknown>;
+		assert.equal(stored["mode"], "auto");
+		assert.equal(stored["apiKey"], "sk_wired_key_1234", "saving the mode keeps the key");
+
+		const notes = stub.notifications.map((note) => note.message).join(" ");
+		assert.match(notes, /saved in/);
+		assert.doesNotMatch(notes, /sk_wired_key_1234/);
+
+		await stub.commands["searlo"].handler("default nonsense", stub.ctx);
+		assert.match(stub.notifications.at(-1)!.message, /usage: \/searlo default/);
+	} finally {
+		cleanup();
+	}
+});
+
+test("one query costs one request per turn", async () => {
+	useConfig({ mode: "auto" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+
+		const prompt = { messageType: "user", prompt: "what is the latest node lts release today" };
+		await fire(stub, "before_agent_start", prompt);
+		// The model then calls the tool for the same question: it must be served from cache.
+		await stub.tools[0].execute("tc1", { query: prompt.prompt }, undefined, undefined, { cwd: process.cwd() });
+		assert.equal(requests.length, 1, "the same search must not be paid for twice in one turn");
+
+		await fire(stub, "agent_end", {});
+		await stub.tools[0].execute("tc2", { query: prompt.prompt }, undefined, undefined, { cwd: process.cwd() });
+		assert.equal(requests.length, 2, "a new turn may search again");
 	} finally {
 		cleanup();
 	}

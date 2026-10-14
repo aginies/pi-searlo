@@ -57,9 +57,23 @@ your credentials or swap in its own key header.
 | Command / mode | Who decides to search | What happens |
 |---|---|---|
 | `/searlo <query>` | you, explicitly | searches and injects the results plus your question as the next turn |
-| `mode: "tool"` (default) | the model | `searlo_search` is active, so pi calls it when it needs fresh data |
-| `mode: "auto"` | a regex heuristic | retrieval runs before the turn starts and is added as hidden context |
-| `mode: "manual"` | nobody | the tool is withdrawn from the active set; only `/searlo <query>` works |
+| `"mode": "tool"` (default) | the model | `searlo_search` is active, so pi calls it when it needs fresh data |
+| `"mode": "auto"` | a regex heuristic | retrieval runs before the turn starts and is added as hidden context |
+| `"mode": "manual"` | nobody | no injection and the tool is withdrawn; only `/searlo <query>` works |
+
+### Turning prompt injection on and off
+
+| Scope | How | Notes |
+|---|---|---|
+| Every new session | `"mode": "auto"` / `"tool"` / `"manual"` in `~/.pi/agent/searlo.json` | the persistent default |
+| This session only | `/searlo auto`, `/searlo on` (= tool), `/searlo off` (= manual) | survives later `/searlo` commands and config edits; resets on a new session or `/reload` |
+| Persistent from inside pi | `/searlo default auto\|tool\|manual` | writes `mode` into `searlo.json` and drops the session override |
+| Off completely | `"mode": "manual"`, or exclude it in `settings.json`: `"extensions": ["-./src/index.ts"]` | `-path` is pi's exact-exclusion syntax for resource arrays |
+
+What each mode actually does: **`auto`** runs a search before the turn starts and adds a hidden
+`searlo:context` message; **`tool`** does no retrieval on its own — the model calls `searlo_search`
+when it judges it needs fresh data; **`manual`** withdraws the tool from the active set and only
+answers to `/searlo <query>`.
 
 `auto` is opt-in because it costs a search per matching prompt and adds a round trip before the first
 token. Its triggers are configurable (`auto.triggerPatterns`, `auto.skipPatterns`, `auto.minPromptChars`).
@@ -69,7 +83,8 @@ token. Its triggers are configurable (`auto.triggerPatterns`, `auto.skipPatterns
 ```text
 /searlo                   status: mode, key source (masked), endpoint
 /searlo <query>           search now and use the results to answer <query>
-/searlo on | off | auto   switch mode for this session
+/searlo auto | on | off   per-session toggle: injection on / model tool / fully manual
+/searlo default <mode>    persist manual|tool|auto into searlo.json for new sessions
 /searlo test [query]      one search, with latency, cache HIT/MISS and credits remaining
 /searlo raw [query]       print the field names of the first raw item (shape diagnosis)
 /searlo config            effective settings and which files contributed them
@@ -120,7 +135,8 @@ src/index.ts    pi wiring: tool, commands, session/mode handling, auto retrieval
 src/config.ts   searlo.json loading, clamping, key resolution, key storage
 src/client.ts   the Searlo HTTP call, envelope + header parsing, error kinds
 src/format.ts   the model-facing context block, budgets, summaries
-test/           42 node:test cases, including a mock Searlo server
+test/           48 node:test cases: a mock Searlo server, config loading, and a
+                stub ExtensionAPI harness that drives tool calls, modes and injection
 ```
 
 ```bash

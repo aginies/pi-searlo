@@ -16,6 +16,7 @@ import {
 	loadConfig,
 	maskKey,
 	resolveKeyFromLocal,
+	setConfigValue,
 	storeApiKey,
 	userConfigPath,
 	writeConfigTemplate,
@@ -34,26 +35,46 @@ interface Session {
 	key: ResolvedKey;
 	/** Config files that contributed to `settings`. */
 	sources: string[];
-	/** query|limit|page -> response, cleared at agent_end so one turn never pays twice. */
-	cache: Map<string, SearchResponse>;
 	/** Live tool state so disabled modes do not expose the tool. */
 	toolActive: boolean;
 }
 
 let session: Session | undefined;
 
+/**
+ * Mode chosen for this session with /searlo on|off|auto. Kept outside the settings object so a
+ * config reload ("/searlo test", an edited searlo.json, /reload of pi resources) cannot silently
+ * flip injection back on or off, and reset on session_start so a new session starts from the file.
+ */
+let modeOverride: SearloMode | undefined;
+
+/** query|limit|page -> response, so one turn never pays for the same search twice. */
+const turnCache = new Map<string, SearchResponse>();
+
 function refreshConfig(cwd?: string, force = false): Session {
 	const loaded = loadConfig({ cwd, force });
-	const local = resolveKeyFromLocal(loaded.settings);
+	// Clone before overriding: loaded.settings may be the object config.ts caches, and mutating it
+	// in place would make a session toggle look like the value that came from the file.
+	const settings: SearloSettings = { ...loaded.settings };
+	if (modeOverride) settings.mode = modeOverride;
+	const local = resolveKeyFromLocal(settings);
 	const key: ResolvedKey = local.key ? local : storedCredentialKey() ?? { ...local, source: "none" as const };
-	session = {
-		settings: loaded.settings,
-		key,
-		sources: loaded.sources,
-		cache: new Map(),
-		toolActive: loaded.settings.mode !== "manual",
-	};
+	session = { settings, key, sources: loaded.sources, toolActive: settings.mode !== "manual" };
 	return session;
+}
+
+/**
+ * Makes the active tool set match the effective mode, touching only our own tool name and
+ * skipping the call when nothing changed, so we do not churn pi's tool-set transcript delta.
+ */
+function syncTools(pi: ExtensionAPI): boolean {
+	const state = session;
+	if (!state) return false;
+	const others = pi.getActiveTools().filter((name) => name !== TOOL_NAME);
+	const isActive = pi.getActiveTools().includes(TOOL_NAME);
+	if (isActive === state.toolActive) return false;
+	pi.setActiveTools(state.toolActive ? [...others, TOOL_NAME] : others);
+	return true;
 }
 
 /** auth.json fallback: /searlo login can store the key with pi's own credential file. */
@@ -90,14 +111,14 @@ async function runSearch(
 	const limit = options.limit ?? state.settings.limit;
 	const page = options.page ?? state.settings.page ?? 1;
 	const cacheKey = `${limit}|${page}|${query.trim().toLowerCase()}`;
-	const cached = state.cache.get(cacheKey);
+	const cached = turnCache.get(cacheKey);
 	if (cached) return cached;
 
 	if (!state.key.key) {
 		throw new SearloError("no-key", `no Searlo API key — ${configError(state) ?? "configure one"}`);
 	}
 	const response = await search(state.settings, query, { key: state.key.key, ...options });
-	state.cache.set(cacheKey, response);
+	turnCache.set(cacheKey, response);
 	return response;
 }
 
@@ -147,21 +168,52 @@ const searchTool = defineTool({
 	},
 });
 
-function applyMode(state: Session, mode: SearloMode, pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
-	state.settings.mode = mode;
-	state.toolActive = mode !== "manual";
-	const active = pi.getActiveTools().filter((name) => name !== TOOL_NAME);
-	pi.setActiveTools(state.toolActive ? [...active, TOOL_NAME] : active);
-	ctx.ui.notify(`searlo mode: ${mode}${state.toolActive ? ` (${TOOL_NAME} active)` : " (manual only)"}`, "info");
+/** Mode with its origin, for /searlo status output. */
+function describeMode(state: Session): string {
+	const budget = `budget: ${state.settings.contentBudgetChars} chars`;
+	if (!modeOverride) return `${state.settings.mode} (from config) · ${budget}`;
+	const fileMode = loadConfig({ cwd: undefined, force: false }).settings.mode;
+	return `${state.settings.mode} (this session; config says ${fileMode}) · ${budget}`;
+}
+
+/** Session-scoped mode change: wins over searlo.json until the session restarts. */
+function applyMode(mode: SearloMode, pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
+	modeOverride = mode;
+	refreshConfig(ctx.cwd, true);
+	syncTools(pi);
+	const effect = mode === "auto" ? "prompt injection ON" : mode === "manual" ? "prompt injection OFF, tool hidden" : `${TOOL_NAME} available to the model, no per-prompt injection`;
+	ctx.ui.notify(`searlo mode: ${mode} (this session) — ${effect}`, "info");
+}
+
+/** Persistent mode change: writes searlo.json and drops the session override. */
+function setDefaultMode(mode: SearloMode, pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
+	try {
+		const stored = setConfigValue("mode", mode);
+		modeOverride = undefined;
+		refreshConfig(ctx.cwd, true);
+		syncTools(pi);
+		ctx.ui.notify(`searlo: mode "${mode}" saved in ${stored.path} — applies to new sessions too`, "info");
+	} catch (error) {
+		ctx.ui.notify(`searlo could not save the mode: ${formatError(error)}`, "error");
+	}
 }
 
 async function handleSearloArgs(args: string, pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
 	const state = refreshConfig(ctx.cwd, true);
 	const [sub, ...rest] = args.trim().split(/\s+/);
 
-	if (sub === "on" || sub === "tool") return applyMode(state, "tool", pi, ctx);
-	if (sub === "auto") return applyMode(state, "auto", pi, ctx);
-	if (sub === "off" || sub === "manual") return applyMode(state, "manual", pi, ctx);
+	if (sub === "on" || sub === "tool") return applyMode("tool", pi, ctx);
+	if (sub === "auto") return applyMode("auto", pi, ctx);
+	if (sub === "off" || sub === "manual") return applyMode("manual", pi, ctx);
+
+	if (sub === "default") {
+		const mode = rest[0] as SearloMode | undefined;
+		if (mode !== "manual" && mode !== "tool" && mode !== "auto") {
+			ctx.ui.notify("usage: /searlo default manual|tool|auto", "warning");
+			return;
+		}
+		return setDefaultMode(mode, pi, ctx);
+	}
 
 	if (sub === "test") {
 		const query = rest.join(" ") || "hello world";
@@ -202,7 +254,7 @@ async function handleSearloArgs(args: string, pi: ExtensionAPI, ctx: ExtensionCo
 			`sources: ${state.sources.join(", ") || "defaults only"}`,
 			`baseUrl: ${state.settings.baseUrl}${state.settings.endpoint}`,
 			`apiKeyHeader: ${state.settings.apiKeyHeader} · limit: ${state.settings.limit} · timeout: ${state.settings.timeoutMs}ms`,
-			`mode: ${state.settings.mode} · budget: ${state.settings.contentBudgetChars} chars`,
+			`mode: ${describeMode(state)}`,
 			`key: ${describeKey(state)}`,
 		];
 		ctx.ui.notify(lines.join("\n"), "info");
@@ -279,18 +331,18 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		// A new session starts from the file again; the previous session's toggle is not carried over.
+		modeOverride = undefined;
+		turnCache.clear();
 		const state = refreshConfig(ctx.cwd);
+		syncTools(pi);
 		const warning = configError(state);
-		if (state.settings.mode !== "manual") {
-			const active = pi.getActiveTools().filter((name) => name !== TOOL_NAME);
-			pi.setActiveTools([...active, TOOL_NAME]);
-		}
 		if (warning) ctx.ui.notify(`searlo: ${warning}`, "warning");
-		else ctx.ui.notify(`searlo ready (${state.settings.mode}) · ${describeKey(state)}`, "info");
+		else ctx.ui.notify(`searlo ready (${describeMode(state)}) · ${describeKey(state)}`, "info");
 	});
 
 	pi.on("agent_end", () => {
-		refreshConfig().cache.clear();
+		turnCache.clear();
 	});
 
 	// Mode "auto": best-effort retrieval before the run starts.

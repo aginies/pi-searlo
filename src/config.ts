@@ -325,17 +325,14 @@ export function writeConfigTemplate(path = userConfigPath(), force = false): str
  * other setting, with 0600 so it is not world-readable. Never call this with a key that
  * came from command arguments, which pi records in the session transcript.
  */
-export function storeApiKey(key: string, path = userConfigPath()): { path: string; created: boolean } {
-	const trimmed = key.trim();
-	if (!trimmed) throw new Error("empty key");
-
+export function setConfigValue(key: string, value: unknown, path = userConfigPath()): { path: string; created: boolean } {
 	const errors: string[] = [];
 	const existing = readJson(path, errors);
 	if (errors.length) throw new Error(`refusing to overwrite an unreadable config: ${errors.join("; ")}`);
 	const created = existing === undefined;
 
 	const next: Record<string, unknown> = { ...(existing ?? {}) };
-	next["apiKey"] = trimmed;
+	next[key] = value;
 
 	mkdirSync(dirname(path), { recursive: true });
 	writeFileSync(path, `${JSON.stringify(next, null, "\t")}\n`, { encoding: "utf8", mode: 0o600 });
@@ -345,4 +342,11 @@ export function storeApiKey(key: string, path = userConfigPath()): { path: strin
 		// Some filesystems ignore the mode; the write itself already succeeded.
 	}
 	return { path, created };
+}
+
+/** Stores the key, or an `env:VAR` indirection. Never pass a key that came from command arguments. */
+export function storeApiKey(key: string, path = userConfigPath()): { path: string; created: boolean } {
+	const trimmed = key.trim();
+	if (!trimmed) throw new Error("empty key");
+	return setConfigValue("apiKey", trimmed, path);
 }
