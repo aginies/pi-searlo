@@ -1,6 +1,6 @@
 {
 	"name": "pi-searlo",
-	"version": "0.1.1",
+	"version": "0.1.2",
 	"description": "Perplexity-style fresh web data for pi, backed by the Searlo search API",
         "author": {
                 "name": "aginies",
@@ -24,6 +24,13 @@
 	"pi": {
 		"extensions": ["./src/index.ts"]
 	},
+	"file": [
+		"src/client.ts",
+	      	"src/config.ts",
+		"src/format.ts",
+		"src/index.ts",
+		"README.md"
+	],
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": ">=1.0.0",
 		"@earendil-works/pi-tui": "*",
