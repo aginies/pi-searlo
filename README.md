@@ -1,8 +1,8 @@
 # pi-searlo
 
 Perplexity-style fresh web data for [pi](https://github.com/earendil-works/pi), backed by the
-[Searlo](https://api.searlo.tech) web search API. Pi gets current, citable facts before it answers,
-instead of answering from a frozen model snapshot.
+[Searlo](https://searlo.tech/) web search API — you need an [API key](#get-an-api-key). Pi gets
+current, citable facts before it answers, instead of answering from a frozen model snapshot.
 
 ```http
 GET https://api.searlo.tech/api/v1/search/web?q=…&limit=…
@@ -24,6 +24,26 @@ pi install npm:pi-searlo
 # or install it as a package
 pi package install <your-scope>/pi-searlo
 ```
+
+## Get an API key
+
+Every search is billed against a **Searlo API key**, so you need one before this extension can do
+anything: sign up at <https://searlo.tech/> and copy a key from the dashboard
+(<https://dashboard.searlo.tech> → *API keys*, where you can create, name, rotate and revoke them).
+A new account comes with free credits and asks for no card (3,000 credits at the time of writing).
+
+Without a key nothing searches, and it says so rather than failing quietly: the extension still
+loads, `session_start` warns `Searlo API key is not configured`, and every path — the
+`searlo_search` tool, `/searlo <query>`, `auto` injection — errors with that same message.
+
+Then put the key where pi can read it, either as an environment variable:
+
+```bash
+export SEARLO_API_KEY=sk_…   # the default name; change it with "apiKeyEnv"
+```
+
+or with `/searlo login` inside pi, which prompts for it and stores it in `~/.pi/agent/searlo.json`
+with mode `0600`, or as `"apiKey"` in that file. The full resolution order is below.
 
 ## Configure
 
