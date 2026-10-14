@@ -18,7 +18,7 @@
  * first item so a surprise shape is a one-command diagnosis.
  */
 
-import type { SearloSettings } from "./config.ts";
+import { MAX_LIMIT, type SearloSettings } from "./config.ts";
 
 export interface SearchResultItem {
 	title: string;
@@ -58,7 +58,7 @@ export interface SearchResponse {
 	raw: { keys: string[]; first: unknown; total: number };
 }
 
-export type SearloErrorKind = "no-key" | "auth" | "http" | "network" | "shape" | "timeout" | "api";
+export type SearloErrorKind = "no-key" | "auth" | "http" | "network" | "shape" | "timeout" | "api" | "rate-limit";
 
 export class SearloError extends Error {
 	readonly kind: SearloErrorKind;
@@ -195,7 +195,11 @@ export function buildSearchUrl(settings: SearloSettings, query: string, options:
 		);
 	}
 	url.searchParams.set("q", query);
-	url.searchParams.set("limit", String(options.limit ?? settings.limit));
+	// The API answers limit > 10 with HTTP 400 VALIDATION_ERROR, so clamp the request itself
+	// rather than trusting whatever a caller passed.
+	const requested = Math.trunc(options.limit ?? settings.limit);
+	const limit = Number.isFinite(requested) && requested >= 1 ? Math.min(MAX_LIMIT, requested) : Math.min(MAX_LIMIT, settings.limit);
+	url.searchParams.set("limit", String(limit));
 	const page = options.page ?? settings.page ?? 1;
 	if (page > 1) url.searchParams.set("page", String(page));
 	for (const [key, value] of Object.entries(settings.params)) {
@@ -236,8 +240,7 @@ export async function search(settings: SearloSettings, query: string, options: S
 
 	const elapsedMs = Date.now() - started;
 	if (!response.ok) {
-		const kind = response.status === 401 || response.status === 403 ? "auth" : "http";
-		throw new SearloError(kind, `Searlo returned HTTP ${response.status}: ${excerpt(text)}`, response.status);
+		throw apiFailure(response.status, text);
 	}
 
 	const parsed = parseJson(text);
@@ -285,6 +288,35 @@ function parseJson(text: string): JsonPayload {
 function excerpt(text: string, max = 240): string {
 	const flat = text.replace(/\s+/g, " ").trim();
 	return flat.length > max ? `${flat.slice(0, max)}…` : flat || "(empty body)";
+}
+
+/**
+ * Turns a non-2xx response into a SearloError. Searlo reports failures as
+ * `{ success:false, code:"VALIDATION_ERROR", message, errors:[{field,message}] }`, so the
+ * message quotes the offending field instead of dumping the raw JSON body at the model.
+ */
+const ERROR_KIND_BY_STATUS: Record<number, SearloErrorKind> = {
+	400: "api",
+	401: "auth",
+	403: "auth",
+	429: "rate-limit",
+};
+
+function apiFailure(status: number, body: string): SearloError {
+	const kind = ERROR_KIND_BY_STATUS[status] ?? "http";
+	const parsed = parseJson(body);
+	const detail = parsed.parsed ? describeErrorBody(asRecord(parsed.value)) : undefined;
+	const message = detail ?? excerpt(body);
+	return new SearloError(kind, `Searlo returned HTTP ${status}: ${message}`, status);
+}
+
+function describeErrorBody(envelope: RecordLike): string | undefined {
+	const code = readString(envelope, ["code", "error_code", "errorCode"]);
+	const message = readString(envelope, ["message", "error", "detail"]);
+	const errors = Array.isArray(envelope["errors"]) ? (envelope["errors"] as unknown[]).map((entry) => readString(asRecord(entry), ["field", "message"])) : [];
+	const fields = errors.filter((value): value is string => Boolean(value)).join(", ");
+	if (!code && !message) return undefined;
+	return [code, message, fields ? `(${fields})` : ""].filter(Boolean).join(" ");
 }
 
 /**

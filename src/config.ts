@@ -15,6 +15,8 @@ import { dirname, join, resolve } from "node:path";
 
 export const CONFIG_BASENAME = "searlo.json";
 export const DEFAULT_API_KEY_ENV = "SEARLO_API_KEY";
+/** The API rejects limit > 10 with HTTP 400 VALIDATION_ERROR. */
+export const MAX_LIMIT = 10;
 
 export type SearloMode = "manual" | "tool" | "auto";
 
@@ -29,7 +31,7 @@ export interface SearloSettings {
 	apiKey?: string;
 	/** Header carrying the key. */
 	apiKeyHeader: string;
-	/** Result count requested from the API (1-50). */
+	/** Result count requested from the API (1-MAX_LIMIT). */
 	limit: number;
 	/** 1-based page for the documented `page` parameter; 1 is never sent. */
 	page?: number;
@@ -171,7 +173,7 @@ function normalize(settings: SearloSettings): SearloSettings {
 		endpoint: endpointRaw.startsWith("/") ? endpointRaw : `/${endpointRaw}`,
 		apiKeyEnv: String(settings.apiKeyEnv ?? "").trim() || DEFAULT_SETTINGS.apiKeyEnv,
 		apiKeyHeader: String(settings.apiKeyHeader ?? "").trim() || DEFAULT_SETTINGS.apiKeyHeader,
-		limit: clampInt(settings.limit, DEFAULT_SETTINGS.limit, 1, 50),
+		limit: clampInt(settings.limit, DEFAULT_SETTINGS.limit, 1, MAX_LIMIT),
 		timeoutMs: clampInt(settings.timeoutMs, DEFAULT_SETTINGS.timeoutMs, 500, 120000),
 		contentBudgetChars: clampInt(settings.contentBudgetChars, DEFAULT_SETTINGS.contentBudgetChars, 500, 200000),
 		params: toStringParams(settings.params),

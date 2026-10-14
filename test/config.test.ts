@@ -60,7 +60,7 @@ test("normalizes user config and clamps out-of-range numbers", () => {
 		const { settings } = loadConfig({ force: true });
 		assert.equal(settings.baseUrl, "https://search.example.test");
 		assert.equal(settings.endpoint, "/api/v1/search/web");
-		assert.equal(settings.limit, 50);
+		assert.equal(settings.limit, 10, "the API rejects limit > 10, so config clamps to its maximum");
 		assert.equal(settings.timeoutMs, 500);
 		assert.equal(settings.contentBudgetChars, 500);
 		assert.deepEqual(settings.params, { language: "en", safesearch: "1" });
@@ -205,7 +205,7 @@ test("getSettings overrides apply on top of the files", () => {
 	withAgentDir((dir) => {
 		writeAgentConfig(dir, { limit: 4 });
 		const loaded = loadConfig({ force: true, overrides: { mode: "auto", limit: 11 } });
-		assert.equal(loaded.settings.limit, 11);
+		assert.equal(loaded.settings.limit, 10, "overrides are clamped to the API maximum too");
 		assert.equal(loaded.settings.mode, "auto");
 	});
 });

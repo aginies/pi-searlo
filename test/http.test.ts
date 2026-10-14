@@ -3,12 +3,13 @@ import { createServer, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, before, test } from "node:test";
 
-import { SearloError, search } from "../src/client.ts";
+import { SearloError, search, buildSearchUrl } from "../src/client.ts";
 import { DEFAULT_SETTINGS, type SearloSettings } from "../src/config.ts";
 
 /** Query strings that select a mock behaviour, so each test drives exactly one path. */
 const MODE_BY_QUERY: Record<string, string> = {
 	"401": "auth",
+	"400": "400",
 	"500": "http",
 	html: "html",
 	badjson: "badjson",
@@ -39,6 +40,17 @@ function reply(mode: string, res: ServerResponse) {
 		case "badjson":
 			res.writeHead(200, { "content-type": "application/json" });
 			res.end("{truncated");
+			return;
+		case "400":
+			res.writeHead(400, { "content-type": "application/json" });
+			res.end(
+				JSON.stringify({
+					success: false,
+					code: "VALIDATION_ERROR",
+					message: 'Query validation failed: "limit" must be less than or equal to 10',
+					errors: [{ field: "limit", message: '"limit" must be less than or equal to 10' }],
+				}),
+			);
 			return;
 		case "empty":
 			res.writeHead(200, { "content-type": "application/json" });
@@ -136,6 +148,26 @@ test("sends page only when it is past the first page", async () => {
 	await search(settings({ page: 3 }), "hello world", { key: "k" });
 	assert.match(seen[0].url, /[?&]page=3/);
 	assert.equal(new URLSearchParams(new URL(seen[0].url, baseUrl).search).get("limit"), "5");
+});
+
+test("clamps limit to the API maximum instead of sending a 400", () => {
+	assert.match(buildSearchUrl(settings(), "q", { limit: 15 }), /limit=10/);
+	assert.match(buildSearchUrl(settings(), "q", { limit: 0 }), /limit=5/, "a junk limit falls back to the configured one");
+	assert.match(buildSearchUrl({ ...settings(), limit: 99 }, "q"), /limit=10/);
+	assert.match(buildSearchUrl(settings(), "q", { limit: 3 }), /limit=3/);
+});
+
+test("an HTTP 400 validation body becomes a readable message, not raw JSON", async () => {
+	await assert.rejects(
+		search(settings(), "400", { key: "k" }),
+		(error) => {
+			if (!(error instanceof SearloError) || error.kind !== "api" || error.status !== 400) return false;
+			assert.match(error.message, /VALIDATION_ERROR/);
+			assert.match(error.message, /limit/);
+			assert.doesNotMatch(error.message, /\{\s*"success/, "must not dump the raw JSON body at the model");
+			return true;
+		},
+	);
 });
 
 test("passes configured params through", async () => {

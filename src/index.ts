@@ -15,6 +15,7 @@ import { readStoredCredential, defineTool, type ExtensionAPI, type ExtensionComm
 import {
 	loadConfig,
 	maskKey,
+	MAX_LIMIT,
 	resolveKeyFromLocal,
 	setConfigValue,
 	storeApiKey,
@@ -131,7 +132,7 @@ function contextBlock(response: SearchResponse, state: Session): string {
 
 const searchParams = Type.Object({
 	query: Type.String({ description: "Search query in natural language" }),
-	limit: Type.Optional(Type.Number({ description: "Override the configured result count (1-50)" })),
+	limit: Type.Optional(Type.Number({ description: `Override the configured result count (1-${MAX_LIMIT})`, minimum: 1, maximum: MAX_LIMIT })),
 	page: Type.Optional(Type.Number({ description: "1-based result page, to go deeper than the first results" })),
 });
 

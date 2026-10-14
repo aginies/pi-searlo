@@ -120,6 +120,8 @@ Everything degrades to "no search happened" rather than blocking your turn:
 |---|---|
 | no key | `session_start` warning, tool call errors with the fix, never crashes |
 | HTTP 401/403 | `auth` error naming the status, the key is never echoed |
+| HTTP 400 `VALIDATION_ERROR` | `api` error quoting `code`, `message` and the offending field, not the raw JSON body |
+| HTTP 429 | `rate-limit` error, so callers can back off |
 | `success: false` in a 200 body | `api` error carrying the API's own message |
 | HTML or truncated body instead of JSON | `shape` error stating what was received |
 | timeout (`timeoutMs`) | `timeout` error; auto mode just skips retrieval |
@@ -127,6 +129,10 @@ Everything degrades to "no search happened" rather than blocking your turn:
 
 One query is fetched at most per turn: results are cached per `(limit, page, query)` and the cache is
 cleared on `agent_end`.
+
+`limit` is capped at **10** — the API answers `limit=11…` with HTTP 400 `VALIDATION_ERROR`. The cap is
+applied twice: `searlo.json` clamps the configured value, and the client clamps each request, so a
+model asking for 15 results costs one valid search of 10 rather than a rejected round trip.
 
 ## Layout
 
