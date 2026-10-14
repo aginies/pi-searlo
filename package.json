@@ -1,0 +1,19 @@
+{
+	"name": "pi-searlo",
+	"version": "0.1.0",
+	"description": "Perplexity-style fresh web data for pi, backed by the Searlo search API",
+	"type": "module",
+	"license": "MIT",
+	"keywords": ["pi-package", "pi", "extension", "search", "searlo", "web"],
+	"pi": {
+		"extensions": ["./src/index.ts"]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": ">=1.2.0",
+		"typebox": ">=1.0.0"
+	},
+	"scripts": {
+		"test": "node --disable-warning=ExperimentalWarning --test 'test/**/*.test.ts'",
+		"dev": "pi --extension ./src/index.ts"
+	}
+}
