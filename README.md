@@ -18,6 +18,9 @@ header: x-api-key: $SEARLO_API_KEY
 # try it on one session
 pi --extension ./src/index.ts
 
+# PI install
+pi install npm:pi-searlo
+
 # or install it as a package
 pi package install <your-scope>/pi-searlo
 ```
