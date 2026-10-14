@@ -39,5 +39,13 @@
 	"scripts": {
 		"test": "node --disable-warning=ExperimentalWarning --test 'test/**/*.test.ts'",
 		"dev": "pi --extension ./src/index.ts"
-	}
+	},
+        "publishConfig": {
+                "access": "public"
+        },
+        "devDependencies": {
+                "@types/node": "^22.0.0",
+                "tsx": "^4.19.0",
+                "typescript": "^5.5.0"
+        }
 }
