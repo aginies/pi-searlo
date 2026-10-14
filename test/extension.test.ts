@@ -188,7 +188,7 @@ test("the bottom bar shows the search type only while searching is enabled", asy
 		assert.equal(stub.status["searlo"], "Searlo: Video");
 
 		await stub.commands["searlo"].handler("off", stub.ctx);
-		assert.equal(stub.status["searlo"], undefined, "manual mode shows nothing");
+		assert.equal(stub.status["searlo"], undefined, "off shows nothing");
 
 		await stub.commands["searlo"].handler("auto", stub.ctx);
 		assert.equal(stub.status["searlo"], "Searlo: Video", "auto shows the current type");
@@ -530,6 +530,87 @@ test("/searlo off withdraws the tool and /searlo on restores it", async () => {
 	}
 });
 
+test("mode off refuses every search, including the ones asked for by hand", async () => {
+	useConfig({ mode: "off" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+
+		assert.deepEqual(stub.active, ["read", "bash"], "the model is left without the tool");
+		assert.equal(stub.status["searlo"], undefined, "off shows nothing in the footer");
+
+		await stub.commands["searlo"].handler("the latest release today", stub.ctx);
+		await stub.commands["searlo"].handler("test the latest release", stub.ctx);
+		await stub.commands["searlo"].handler("raw the latest release", stub.ctx);
+		const injected = await fire(stub, "before_agent_start", {
+			messageType: "user",
+			prompt: "what is the latest node lts release today",
+		});
+
+		assert.deepEqual(injected, [undefined], "no per-prompt retrieval");
+		assert.equal(stub.sentUserMessages.length, 0, "no search was injected as a turn");
+		assert.deepEqual(requests, [], "off must not spend one single request");
+		assert.match(stub.notifications.map((note) => note.message).join(" "), /searlo is off/);
+
+		// Defence in depth: even a stale active-tool set cannot get a search through runSearch.
+		await assert.rejects(
+			() => stub.tools[0].execute("tc1", { query: "anything at all" }, undefined, undefined, { cwd: process.cwd() }),
+			/searlo is off/,
+		);
+		assert.deepEqual(requests, [], "the tool path is refused before the network too");
+	} finally {
+		cleanup();
+	}
+});
+
+test("/searlo off is absolute while /searlo manual still answers /searlo <query>", async () => {
+	useConfig({ mode: "tool" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+
+		await stub.commands["searlo"].handler("off", stub.ctx);
+		await stub.commands["searlo"].handler("latest searlo docs", stub.ctx);
+		assert.equal(stub.sentUserMessages.length, 0, "off refused the hand-run search");
+		assert.deepEqual(requests, []);
+		assert.match(stub.notifications.at(-1)!.message, /\/searlo manual\|on\|auto/, "the refusal says how to turn it back on");
+
+		await stub.commands["searlo"].handler("manual", stub.ctx);
+		assert.deepEqual(stub.active, ["read", "bash"], "manual still hides the tool");
+		await stub.commands["searlo"].handler("latest searlo docs", stub.ctx);
+		assert.equal(stub.sentUserMessages.length, 1, "manual answers explicit /searlo searches");
+		assert.equal(requests.length, 1);
+	} finally {
+		cleanup();
+	}
+});
+
+test("the picker can switch to Off and back to a searching mode", async () => {
+	useConfig({ mode: "tool" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+		const binding = stub.handlers["shortcut:f3"][0];
+
+		stub.selectQueue = ["○ Off (no Searlo searches)"];
+		await binding(stub.ctx);
+		assert.deepEqual(stub.active, ["read", "bash"]);
+
+		await stub.commands["searlo"].handler("test the latest release", stub.ctx);
+		assert.deepEqual(requests, [], "the picker's Off means no searches");
+
+		stub.selectQueue = ["○ Manual (only /searlo searches)"];
+		await binding(stub.ctx);
+		await stub.commands["searlo"].handler("test the latest release", stub.ctx);
+		assert.equal(requests.length, 1, "Manual searched again from the command");
+	} finally {
+		cleanup();
+	}
+});
+
 test("a session mode toggle survives later /searlo commands", async () => {
 	useConfig({ mode: "tool" });
 	try {
@@ -590,6 +671,10 @@ test("/searlo default writes the mode to the config file", async () => {
 
 		await stub.commands["searlo"].handler("default nonsense", stub.ctx);
 		assert.match(stub.notifications.at(-1)!.message, /usage: \/searlo default/);
+
+		await stub.commands["searlo"].handler("default off", stub.ctx);
+		const persistedOff = JSON.parse(readFileSync(join(agentDir, "searlo.json"), "utf8")) as Record<string, unknown>;
+		assert.equal(persistedOff["mode"], "off", "off is a persistable default");
 	} finally {
 		cleanup();
 	}

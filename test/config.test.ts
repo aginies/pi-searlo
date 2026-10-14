@@ -80,6 +80,17 @@ test("a malformed config degrades to defaults with a reported error", () => {
 	});
 });
 
+test("every mode is accepted and junk falls back to the default", () => {
+	withAgentDir((dir) => {
+		for (const mode of ["off", "manual", "tool", "auto"]) {
+			writeAgentConfig(dir, { mode });
+			assert.equal(loadConfig({ force: true }).settings.mode, mode);
+		}
+		writeAgentConfig(dir, { mode: "nope" });
+		assert.equal(loadConfig({ force: true }).settings.mode, DEFAULT_SETTINGS.mode, "an unknown mode must not disable searching");
+	});
+});
+
 test("junk types in config do not crash loading", () => {
 	withAgentDir((dir) => {
 		writeAgentConfig(dir, { limit: "ten", mode: "yolo", params: "nope", auto: { triggerPatterns: "latest" } });

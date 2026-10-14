@@ -96,40 +96,72 @@ choice, so "which one is selected" is answerable at a glance:
 Searlo
 ● Model decides (searches on demand)
 ○ Inject into every matching prompt
-○ Off (only /searlo searches)
+○ Manual (only /searlo searches)
+○ Off (no Searlo searches)
 ◆  Change search type…          → web | images | news | videos | shopping
 ```
 
-Choosing `Off` is the same as `/searlo off`. While searching is enabled the built-in footer shows
-`Searlo: <type>`; it disappears in manual mode, and `"showStatus": false` hides it entirely without
-disabling search. Shortcuts cannot be re-registered at runtime, so changing `shortcut` needs a pi
-restart or `/reload`.
+Choosing `Off` is the same as `/searlo off`. While the model may search, the built-in footer shows
+`Searlo: <type>`; it disappears in `manual` and `off`, and `"showStatus": false` hides it entirely
+without disabling search. Shortcuts cannot be re-registered at runtime, so changing `shortcut` needs
+a pi restart or `/reload`.
 
-## Three ways to use it
+## Four ways to use it
 
 | Command / mode | Who decides to search | What happens |
 |---|---|---|
 | `/searlo <query>` | you, explicitly | searches and injects the results plus your question as the next turn |
 | `"mode": "tool"` (default) | the model | `searlo_search` is active, so pi calls it when it needs fresh data |
 | `"mode": "auto"` | a regex heuristic | retrieval runs before the turn starts and is added as hidden context |
-| `"mode": "manual"` | nobody | no injection and the tool is withdrawn; only `/searlo <query>` works |
+| `"mode": "manual"` | nobody, but you | no injection and the tool is withdrawn; `/searlo <query>` still searches |
+| `"mode": "off"` | nobody at all | no injection, no tool, and `/searlo <query>` / `test` / `raw` are refused: zero requests |
 
 ### Turning prompt injection on and off
 
 | Scope | How | Notes |
 |---|---|---|
-| Every new session | `"mode": "auto"` / `"tool"` / `"manual"` in `~/.pi/agent/searlo.json` | the persistent default |
-| This session only | `/searlo auto`, `/searlo on` (= tool), `/searlo off` (= manual) | survives later `/searlo` commands and config edits; resets on a new session or `/reload` |
-| Persistent from inside pi | `/searlo default auto\|tool\|manual` | writes `mode` into `searlo.json` and drops the session override |
-| Off completely | `"mode": "manual"`, or exclude it in `settings.json`: `"extensions": ["-./src/index.ts"]` | `-path` is pi's exact-exclusion syntax for resource arrays |
+| Every new session | `"mode": "off"` / `"manual"` / `"tool"` / `"auto"` in `~/.pi/agent/searlo.json` | the persistent default |
+| This session only | `/searlo auto`, `/searlo on` (= tool), `/searlo manual`, `/searlo off` | survives later `/searlo` commands and config edits; resets on a new session or `/reload` |
+| Persistent from inside pi | `/searlo default off\|manual\|tool\|auto` | writes `mode` into `searlo.json` and drops the session override |
+| Off completely | `"mode": "off"`, or exclude it in `settings.json`: `"extensions": ["-./src/index.ts"]` | `-path` is pi's exact-exclusion syntax for resource arrays |
 
 What each mode actually does: **`auto`** runs a search before the turn starts and adds a hidden
 `searlo:context` message; **`tool`** does no retrieval on its own — the model calls `searlo_search`
 when it judges it needs fresh data; **`manual`** withdraws the tool from the active set and only
-answers to `/searlo <query>`.
+answers to `/searlo <query>`; **`off`** refuses everything, including the searches you ask for by
+hand.
 
 `auto` is opt-in because it costs a search per matching prompt and adds a round trip before the first
-token. Its triggers are configurable (`auto.triggerPatterns`, `auto.skipPatterns`, `auto.minPromptChars`).
+token.
+
+### What "matching prompt" means
+
+`auto` does not search every turn — it checks your prompt against three gates, in this order, and
+searches only when all three pass:
+
+| Gate | Default | Effect |
+|---|---|---|
+| `auto.minPromptChars` | `24` | shorter prompts are skipped: "what's the latest node lts release" qualifies, "hi" does not |
+| `auto.skipPatterns` | `^\s*/`, `\b(hi\|hello\|hey\|thanks\|thank you)\b` | a match **never** searches, so slash commands and greetings cost nothing |
+| `auto.triggerPatterns` | latest/recent/currently/today/…, new/release/changelog/version/…, `as of 20\d\d`, `search\|look up\|google\|find online` | at least one must match: this is the time-sensitivity guess |
+
+All three are regexes matched case-insensitively against the raw prompt, and they are yours to tune
+in `searlo.json`:
+
+```json
+{
+	"mode": "auto",
+	"auto": {
+		"minPromptChars": 12,
+		"triggerPatterns": ["\\b(latest|release|price|version)\\b"],
+		"skipPatterns": ["^\\s*/", "\\brefactor\\b"]
+	}
+}
+```
+
+Only real user turns are tested: a `custom` message injected by an extension never re-triggers
+retrieval, and a prompt that matches but returns no results adds nothing. A failing search is
+reported as a warning and the turn continues unsearched — auto mode never blocks you.
 
 ## Commands
 
@@ -137,8 +169,8 @@ token. Its triggers are configurable (`auto.triggerPatterns`, `auto.skipPatterns
 /searlo                   status: mode, key source (masked), endpoint
 /searlo <query>           search now and use the results to answer <query>
 /searlo <vertical>: <query>  one shot in that vertical: web|images|news|videos|shopping
-/searlo auto | on | off   per-session toggle: injection on / model tool / fully manual
-/searlo default <mode>    persist manual|tool|auto into searlo.json for new sessions
+/searlo auto|on|manual|off  per-session toggle: injection / model tool / hand-run only / nothing
+/searlo default <mode>    persist off|manual|tool|auto into searlo.json for new sessions
 /searlo vertical <name> [--save]  search type for this session, or persisted with --save
 /searlo test [query]      one search, with latency, cache HIT/MISS and credits remaining
 /searlo raw [query]       print the field names of the first raw item (shape diagnosis)

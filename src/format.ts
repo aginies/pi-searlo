@@ -1,6 +1,11 @@
 /**
  * Turns Searlo results into a model-facing context block, and into short
  * human-readable lines for notifications and the /searlo status output.
+ *
+ * Two renderings of the same block: the default text list, and TOON
+ * (Token-Oriented Object Notation, https://toonformat.dev) — one header line that names the
+ * columns, then one row per result. Same data, no repeated keys, so the model reads it in
+ * materially fewer tokens.
  */
 
 import type { SearchResponse, SearchResultItem } from "./client.ts";
@@ -13,6 +18,8 @@ export interface FormatOptions {
 	budgetChars: number;
 	/** Include the citation/grounding rules. */
 	includeCitations: boolean;
+	/** Render as TOON instead of the line-per-result text block. */
+	toon?: boolean;
 }
 
 function host(url: string): string {

@@ -82,7 +82,17 @@ export interface SearchResponse {
 	raw: { keys: string[]; first: unknown; total: number };
 }
 
-export type SearloErrorKind = "no-key" | "auth" | "http" | "network" | "shape" | "timeout" | "api" | "rate-limit";
+export type SearloErrorKind =
+	| "no-key"
+	| "auth"
+	| "http"
+	| "network"
+	| "shape"
+	| "timeout"
+	| "api"
+	| "rate-limit"
+	/** Mode "off" refused the search, so nothing was sent and nothing was billed. */
+	| "disabled";
 
 export class SearloError extends Error {
 	readonly kind: SearloErrorKind;

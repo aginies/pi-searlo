@@ -25,7 +25,11 @@ export function defaultEndpoints(): Record<SearchVertical, string> {
 /** The API rejects limit above the vertical ceiling with HTTP 400 VALIDATION_ERROR. */
 export const MAX_LIMIT = 10;
 
-export type SearloMode = "manual" | "tool" | "auto";
+/**
+ * `off` refuses every search, including the ones you ask for by hand; `manual` hides the tool and
+ * answers only to `/searlo` commands. `tool` lets the model search, `auto` also injects per prompt.
+ */
+export type SearloMode = "off" | "manual" | "tool" | "auto";
 
 /** The five Searlo search endpoints. */
 export type SearchVertical = "web" | "images" | "news" | "videos" | "shopping";
@@ -127,7 +131,7 @@ export interface SearloSettings {
 	params: Record<string, string>;
 	/** Request timeout in milliseconds. */
 	timeoutMs: number;
-	/** Tool activation policy for this session. */
+	/** Search policy for this session: off | manual | tool | auto. */
 	mode: SearloMode;
 	/** Max characters of snippet text handed to the model per search. */
 	contentBudgetChars: number;
@@ -267,6 +271,13 @@ function normalizeEndpoints(
 	return endpoints;
 }
 
+/** In picker order: the modes a user can be in, from most to least searching. */
+export const MODE_NAMES: readonly SearloMode[] = ["off", "manual", "tool", "auto"];
+
+export function isMode(value: unknown): value is SearloMode {
+	return typeof value === "string" && (MODE_NAMES as readonly string[]).includes(value);
+}
+
 function normalizeVertical(value: unknown, errors: string[]): SearchVertical {
 	if (value === undefined) return DEFAULT_SETTINGS.vertical;
 	if (isVertical(value)) return value;
@@ -327,7 +338,7 @@ function normalize(settings: SearloSettings): SearloSettings {
 		contentBudgetChars: clampInt(settings.contentBudgetChars, DEFAULT_SETTINGS.contentBudgetChars, 500, 200000),
 		params: toStringParams(settings.params),
 		page: clampInt(settings.page, 1, 1, 100),
-		mode: mode === "manual" || mode === "tool" || mode === "auto" ? mode : DEFAULT_SETTINGS.mode,
+		mode: isMode(mode) ? mode : DEFAULT_SETTINGS.mode,
 		includeCitations: settings.includeCitations !== false,
 		shortcut: normalizeShortcut(settings.shortcut),
 		showStatus: normalizeBool(settings.showStatus, true),
@@ -458,7 +469,8 @@ export function defaultConfigTemplate(): string {
 		vertical: DEFAULT_SETTINGS.vertical,
 		// Per-vertical paths, only needed if Searlo renames an endpoint.
 		endpoints: defaultEndpoints(),
-		// "tool" lets the model search, "auto" injects into every matching prompt, "manual" is /searlo only.
+		// "off" refuses every search, "manual" is /searlo only, "tool" lets the model search,
+		// "auto" also injects into every matching prompt.
 		mode: "tool",
 		// Opens the mode/vertical picker; any pi KeyId works, e.g. "ctrl+g".
 		shortcut: "f3",

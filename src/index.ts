@@ -3,10 +3,13 @@
  *
  *   GET {baseUrl}{endpoint}?q=…&limit=…   header: x-api-key: …   ->  { items: [...] }
  *
- * Two entry points:
+ * Three entry points:
  *   M1  /searlo <query>   search now, inject the results into the conversation
  *   M2  searlo_search     a tool the model calls whenever it needs fresh data
  *   M3  mode "auto"       best-effort retrieval before a run starts (opt-in)
+ *
+ * `mode` gates all three: "manual" keeps M1 only, and "off" refuses M1 as well, so nothing is sent
+ * and nothing is billed. `runSearch` is the single place that decides, which is what makes "off" total.
  */
 
 import { Type } from "typebox";
@@ -17,6 +20,8 @@ import {
 	maskKey,
 	MAX_LIMIT,
 	isVertical,
+	isMode,
+	MODE_NAMES,
 	VERTICAL_NAMES,
 	VERTICALS,
 	setConfigValue,
@@ -49,12 +54,28 @@ const VERTICAL_STATUS: Record<SearchVertical, string> = {
 const MODE_CHOICES: { mode: SearloMode; label: string }[] = [
 	{ mode: "tool", label: "Model decides (searches on demand)" },
 	{ mode: "auto", label: "Inject into every matching prompt" },
-	{ mode: "manual", label: "Off (only /searlo searches)" },
+	{ mode: "manual", label: "Manual (only /searlo searches)" },
+	{ mode: "off", label: "Off (no Searlo searches)" },
 ];
+
+/** Modes where the model may call the tool; `manual` and `off` both withdraw it. */
+function toolEnabled(mode: SearloMode): boolean {
+	return mode === "tool" || mode === "auto";
+}
+
+/** The one mode where no request may leave the machine, not even one you ask for by hand. */
+function searchForbidden(mode: SearloMode): boolean {
+	return mode === "off";
+}
+
+/** Why a search was refused, with the way back in: shown to the user and to the model alike. */
+function offMessage(settings: SearloSettings): string {
+	return `searlo is off — no searches are performed, not even /searlo <query>. /searlo manual|on|auto turns it back on (${settings.shortcut} opens the picker)`;
+}
 
 /** The text shown in the bottom bar, or undefined to show nothing. */
 function statusText(state: Session): string | undefined {
-	if (!state.settings.showStatus || state.settings.mode === "manual") return undefined;
+	if (!state.settings.showStatus || !toolEnabled(state.settings.mode)) return undefined;
 	return `Searlo: ${VERTICAL_STATUS[activeVertical(state)]}`;
 }
 
@@ -81,7 +102,7 @@ let session: Session | undefined;
 const ctxlessWarnings: string[] = [];
 
 /**
- * Mode chosen for this session with /searlo on|off|auto. Kept outside the settings object so a
+ * Mode chosen for this session with /searlo off|manual|on|auto. Kept outside the settings object so a
  * config reload ("/searlo test", an edited searlo.json, /reload of pi resources) cannot silently
  * flip injection back on or off, and reset on session_start so a new session starts from the file.
  */
@@ -102,7 +123,7 @@ function refreshConfig(cwd?: string, force = false): Session {
 	if (verticalOverride) settings.vertical = verticalOverride;
 	const local = resolveKeyFromLocal(settings);
 	const key: ResolvedKey = local.key ? local : storedCredentialKey() ?? { ...local, source: "none" as const };
-	session = { settings, key, sources: loaded.sources, toolActive: settings.mode !== "manual" };
+	session = { settings, key, sources: loaded.sources, toolActive: toolEnabled(settings.mode) };
 	return session;
 }
 
@@ -146,11 +167,19 @@ function configError(state: Session): string | undefined {
 	return problems.length ? problems.join("; ") : undefined;
 }
 
+/** A hand-asked search in mode "off": say no, and say how to say yes, without spending a request. */
+function notifyOff(state: Session, ctx: ExtensionContext): void {
+	ctx.ui.notify(offMessage(state.settings), "warning");
+}
+
 async function runSearch(
 	state: Session,
 	query: string,
 	options: { signal?: AbortSignal; limit?: number; page?: number; vertical?: SearchVertical } = {},
 ): Promise<SearchResponse> {
+	// Every search path funnels through here, so "off" has exactly one choke point: a stale active
+	// tool set or a forgotten caller still cannot spend credits while the user asked for no searches.
+	if (searchForbidden(state.settings.mode)) throw new SearloError("disabled", offMessage(state.settings));
 	const limit = options.limit ?? state.settings.limit;
 	const page = options.page ?? state.settings.page ?? 1;
 	const vertical = options.vertical ?? activeVertical(state);
@@ -252,7 +281,7 @@ function describeVertical(state: Session): string {
  */
 async function openPicker(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
 	if (!ctx.hasUI) {
-		ctx.ui.notify("searlo: the picker needs an interactive session; use /searlo on|auto|off", "warning");
+		ctx.ui.notify("searlo: the picker needs an interactive session; use /searlo off|manual|on|auto", "warning");
 		return;
 	}
 	const state = refreshConfig(ctx.cwd, true);
@@ -296,9 +325,10 @@ function describeMode(state: Session): string {
 
 /** What a mode switch actually enables, for the notification. */
 const MODE_EFFECT: Record<SearloMode, string> = {
+	off: "nothing searches: tool hidden, no injection, /searlo <query> refused",
+	manual: "prompt injection OFF, tool hidden, /searlo <query> still works",
 	tool: `${TOOL_NAME} available to the model, no per-prompt injection`,
 	auto: "prompt injection ON",
-	manual: "prompt injection OFF, tool hidden",
 };
 
 /** Session-scoped mode change: wins over searlo.json until the session restarts. */
@@ -344,18 +374,21 @@ async function handleSearloArgs(args: string, pi: ExtensionAPI, ctx: ExtensionCo
 
 	if (sub === "on" || sub === "tool") return applyMode("tool", pi, ctx);
 	if (sub === "auto") return applyMode("auto", pi, ctx);
-	if (sub === "off" || sub === "manual") return applyMode("manual", pi, ctx);
+	// "off" is the absolute one; the old "manual, but only by hand" behaviour keeps its own word.
+	if (sub === "off") return applyMode("off", pi, ctx);
+	if (sub === "manual") return applyMode("manual", pi, ctx);
 
 	if (sub === "default") {
-		const mode = rest[0] as SearloMode | undefined;
-		if (mode !== "manual" && mode !== "tool" && mode !== "auto") {
-			ctx.ui.notify("usage: /searlo default manual|tool|auto", "warning");
+		const mode = rest[0];
+		if (!isMode(mode)) {
+			ctx.ui.notify(`usage: /searlo default ${MODE_NAMES.join("|")}`, "warning");
 			return;
 		}
 		return setDefaultMode(mode, pi, ctx);
 	}
 
 	if (sub === "test") {
+		if (searchForbidden(state.settings.mode)) return notifyOff(state, ctx);
 		const target = splitVertical(rest);
 		const query = target.query || "hello world";
 		ctx.ui.notify(`searlo: searching “${query}” (${target.vertical ?? activeVertical(state)})…`, "info");
@@ -435,6 +468,7 @@ async function handleSearloArgs(args: string, pi: ExtensionAPI, ctx: ExtensionCo
 	}
 
 	if (sub === "raw") {
+		if (searchForbidden(state.settings.mode)) return notifyOff(state, ctx);
 		const target = splitVertical(rest);
 		const query = target.query || "hello world";
 		try {
@@ -450,13 +484,14 @@ async function handleSearloArgs(args: string, pi: ExtensionAPI, ctx: ExtensionCo
 	}
 
 	// Default: run a search and inject it as extra context for the next answer.
+	if (searchForbidden(state.settings.mode)) return notifyOff(state, ctx);
 	const target = splitVertical(args.trim().split(/\s+/).filter(Boolean));
 	const query = target.query;
 	if (!query) {
 		ctx.ui.notify(
 			[
 				`mode: ${state.settings.mode} · vertical: ${activeVertical(state)} · key: ${state.key.key ? describeKey(state) : "not configured"}`,
-				`/searlo <query> · /searlo ${VERTICAL_NAMES.join("|")}: <query> · /searlo on|auto|off · /searlo vertical <name> · /searlo test · /searlo config`,
+				`/searlo <query> · /searlo ${VERTICAL_NAMES.join("|")}: <query> · /searlo off|manual|on|auto · /searlo vertical <name> · /searlo test · /searlo config`,
 			].join("\n"),
 			"info",
 		);
@@ -503,9 +538,9 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("searlo", {
-		description: `Search the web via Searlo: /searlo <query> | images:\u003cquery> | on | auto | off | vertical <name> | test | login | config | init (${binding} opens the picker)`,
+		description: `Search the web via Searlo: /searlo <query> | images:\u003cquery> | off | manual | on | auto | vertical <name> | test | login | config | init (${binding} opens the picker)`,
 		getArgumentCompletions: (prefix) => {
-			const words = ["on", "auto", "off", "test", "config", "login", "init", "raw", "vertical", "default", ...VERTICAL_NAMES];
+			const words = ["off", "manual", "on", "auto", "test", "config", "login", "init", "raw", "vertical", "default", ...VERTICAL_NAMES];
 			const head = prefix.trim();
 			const hits = words.filter((word) => word.startsWith(head));
 			return hits.length ? hits.map((label) => ({ value: `${label} `, label })) : null;
@@ -527,6 +562,8 @@ export default function (pi: ExtensionAPI) {
 		for (const note of ctxlessWarnings) ctx.ui.notify(`searlo: ${note}`, "warning");
 		ctxlessWarnings.length = 0;
 		if (warning) ctx.ui.notify(`searlo: ${warning}`, "warning");
+		// "ready" would be a lie in the mode that refuses every search, so say what is disabled.
+		else if (searchForbidden(state.settings.mode)) ctx.ui.notify(offMessage(state.settings), "info");
 		else ctx.ui.notify(`searlo ready (${describeMode(state)}) · ${describeKey(state)}`, "info");
 	});
 
