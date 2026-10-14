@@ -2,14 +2,31 @@
 	"name": "pi-searlo",
 	"version": "0.1.0",
 	"description": "Perplexity-style fresh web data for pi, backed by the Searlo search API",
+        "author": {
+                "name": "aginies",
+                "email": "antoine@ginies.org"
+        },
 	"type": "module",
+        "engines": {
+                "node": ">=22.19.0"
+        },
+        "repository": {
+                "type": "git",
+                "url": "https://github.com/aginies/pi-searlo",
+                "directory": "extensions/pi-searlo"
+        },
+        "homepage": "https://github.com/aginies/pi-searlo",
+	"bugs": {
+                "url": "git+https://github.com/aginies/searlo/issues"
+        },
 	"license": "MIT",
-	"keywords": ["pi-package", "pi", "extension", "search", "searlo", "web"],
+	"keywords": ["pi-package", "pi-extension", "search", "searlo", "web"],
 	"pi": {
 		"extensions": ["./src/index.ts"]
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-coding-agent": ">=1.2.0",
+		"@earendil-works/pi-coding-agent": ">=1.0.0",
+		"@earendil-works/pi-tui": "*",
 		"typebox": ">=1.0.0"
 	},
 	"scripts": {
