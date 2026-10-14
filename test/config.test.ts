@@ -39,7 +39,9 @@ test("defaults to the searlo api without any config file", () => {
 		assert.equal(loaded.usingDefaults, true);
 		assert.deepEqual(loaded.errors, []);
 		assert.equal(loaded.settings.baseUrl, "https://api.searlo.tech");
-		assert.equal(loaded.settings.endpoint, "/api/v1/search/web");
+		assert.equal(loaded.settings.vertical, "web");
+		assert.equal(loaded.settings.endpoints.web, "/api/v1/search/web");
+		assert.equal(loaded.settings.endpoints.shopping, "/api/v1/search/shopping");
 		assert.equal(loaded.settings.apiKeyHeader, "x-api-key");
 		assert.equal(loaded.settings.mode, DEFAULT_SETTINGS.mode);
 		assert.ok(dir);
@@ -59,7 +61,7 @@ test("normalizes user config and clamps out-of-range numbers", () => {
 		});
 		const { settings } = loadConfig({ force: true });
 		assert.equal(settings.baseUrl, "https://search.example.test");
-		assert.equal(settings.endpoint, "/api/v1/search/web");
+		assert.equal(settings.endpoints.web, "/api/v1/search/web", "the legacy single endpoint gains a leading slash");
 		assert.equal(settings.limit, 10, "the API rejects limit > 10, so config clamps to its maximum");
 		assert.equal(settings.timeoutMs, 500);
 		assert.equal(settings.contentBudgetChars, 500);

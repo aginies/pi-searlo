@@ -124,6 +124,10 @@ test("sends the documented request and maps the documented envelope", async () =
 		published: undefined,
 		rank: 1,
 		score: undefined,
+		type: undefined,
+		image: undefined,
+		news: undefined,
+		price: undefined,
 	});
 	assert.deepEqual(response.information, {
 		totalResults: "1250000",

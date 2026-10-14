@@ -18,7 +18,7 @@
  * first item so a surprise shape is a one-command diagnosis.
  */
 
-import { MAX_LIMIT, type SearloSettings } from "./config.ts";
+import { type SearchVertical, type SearloSettings, verticalSpec } from "./config.ts";
 
 export interface SearchResultItem {
 	title: string;
@@ -28,6 +28,29 @@ export interface SearchResultItem {
 	published?: string;
 	rank?: number;
 	score?: number;
+	/** `web`, `image`, `news`, `video`, `shopping` when the API labels it. */
+	type?: string;
+	/** Images vertical. */
+	image?: SearchImage;
+	/** News vertical. */
+	news?: SearchNewsArticle;
+	/** Shopping vertical, e.g. "$79.99". */
+	price?: string;
+}
+
+export interface SearchImage {
+	src?: string;
+	thumbnail?: string;
+	width?: number;
+	height?: number;
+	/** Page that hosts the image, usually a better link than the raw file. */
+	contextLink?: string;
+}
+
+export interface SearchNewsArticle {
+	source?: string;
+	publishedDate?: string;
+	author?: string;
 }
 
 export interface SearchInformation {
@@ -48,6 +71,7 @@ export interface SearchAccount {
 
 export interface SearchResponse {
 	query: string;
+	vertical: SearchVertical;
 	url: string;
 	status: number;
 	elapsedMs: number;
@@ -111,21 +135,41 @@ function readBoolean(record: RecordLike, key: string): boolean | undefined {
 	return typeof value === "boolean" ? value : undefined;
 }
 
-/** Accepts the documented `items[]`, and common alternative shapes as fallbacks. */
-export function extractItems(payload: unknown): unknown[] {
+/** Reads the result list for a vertical: shopping uses its own key. */
+export function extractItems(payload: unknown, vertical: SearchVertical = "web"): unknown[] {
 	if (Array.isArray(payload)) return payload;
 	const record = asRecord(payload);
-	for (const key of ["items", "results", "organic", "web", "data"]) {
+	for (const key of verticalSpec(vertical).listKeys) {
 		const value = record[key];
 		if (Array.isArray(value)) return value;
 		if (value && typeof value === "object") {
 			const nested = asRecord(value);
-			for (const inner of ["items", "results"]) {
+			for (const inner of verticalSpec(vertical).listKeys) {
 				if (Array.isArray(nested[inner])) return nested[inner] as unknown[];
 			}
 		}
 	}
 	return [];
+}
+
+function readImage(record: RecordLike): SearchImage | undefined {
+	const nested = asRecord(record["image"]);
+	const src = readString(nested, ["src", "url", "link"]) ?? readString(record, ["imageUrl", "image_url", "thumbnailUrl"]);
+	const thumbnail = readString(nested, ["thumbnail", "thumb", "thumbnailUrl"]);
+	const width = readNumber(nested, ["width"]);
+	const height = readNumber(nested, ["height"]);
+	const contextLink = readString(nested, ["contextLink", "context_link"]);
+	if (!src && !thumbnail && !width && !height && !contextLink) return undefined;
+	return { src, thumbnail, width, height, contextLink };
+}
+
+function readNews(record: RecordLike): SearchNewsArticle | undefined {
+	const nested = asRecord(record["news"]);
+	const source = readString(nested, ["source", "publisher"]);
+	const publishedDate = readString(nested, ["publishedDate", "published_date", "date"]);
+	const author = readString(nested, ["author", "by"]);
+	if (!source && !publishedDate && !author) return undefined;
+	return { source, publishedDate, author };
 }
 
 export function normalizeItems(rawItems: unknown[]): SearchResultItem[] {
@@ -137,7 +181,9 @@ export function normalizeItems(rawItems: unknown[]): SearchResultItem[] {
 			continue;
 		}
 		const record = asRecord(entry);
-		const url = readString(record, URL_KEYS) ?? "";
+		const image = readImage(record);
+		const news = readNews(record);
+		const url = readString(record, URL_KEYS) ?? image?.contextLink ?? image?.src ?? "";
 		const title = readString(record, TITLE_KEYS) ?? url ?? "Untitled result";
 		const dedupeKey = url || title;
 		if (dedupeKey) {
@@ -148,10 +194,14 @@ export function normalizeItems(rawItems: unknown[]): SearchResultItem[] {
 			title,
 			url,
 			snippet: readString(record, SNIPPET_KEYS) ?? "",
-			source: readString(record, SOURCE_KEYS),
-			published: readString(record, DATE_KEYS),
+			source: news?.source ?? readString(record, SOURCE_KEYS),
+			published: readString(record, DATE_KEYS) ?? news?.publishedDate,
 			rank: readNumber(record, RANK_KEYS),
 			score: readNumber(record, SCORE_KEYS),
+			type: readString(record, ["type", "kind"]),
+			image,
+			news,
+			price: readString(record, ["price", "productPrice", "priceFormated"]),
 		});
 	}
 	return items;
@@ -182,26 +232,42 @@ export interface SearchOptions {
 	signal?: AbortSignal;
 	limit?: number;
 	page?: number;
+	vertical?: SearchVertical;
 }
 
-export function buildSearchUrl(settings: SearloSettings, query: string, options: Pick<SearchOptions, "limit" | "page"> = {}): string {
+/** Resolves the endpoint for a vertical, falling back to the web path when misconfigured. */
+export function endpointFor(settings: SearloSettings, vertical: SearchVertical): string {
+	return settings.endpoints?.[vertical] || verticalSpec(vertical).path;
+}
+
+export function buildSearchUrl(
+	settings: SearloSettings,
+	query: string,
+	options: Pick<SearchOptions, "limit" | "page" | "vertical"> = {},
+): string {
+	const vertical = options.vertical ?? settings.vertical ?? "web";
+	const spec = verticalSpec(vertical);
+	const path = endpointFor(settings, vertical);
 	let url: URL;
 	try {
-		url = new URL(`${settings.baseUrl}${settings.endpoint}`);
+		url = new URL(`${settings.baseUrl}${path}`);
 	} catch {
 		throw new SearloError(
 			"shape",
-			`invalid Searlo endpoint config: baseUrl="${settings.baseUrl}" endpoint="${settings.endpoint}" must combine into a valid URL`,
+			`invalid Searlo endpoint config: baseUrl="${settings.baseUrl}" ${vertical} endpoint="${path}" must combine into a valid URL`,
 		);
 	}
 	url.searchParams.set("q", query);
-	// The API answers limit > 10 with HTTP 400 VALIDATION_ERROR, so clamp the request itself
-	// rather than trusting whatever a caller passed.
+	// Each endpoint publishes its own ceiling (10 for web/images/news/videos, 55 for shopping) and
+	// answers an over-large limit with HTTP 400 VALIDATION_ERROR, so clamp the request itself rather
+	// than trusting whatever a caller passed.
 	const requested = Math.trunc(options.limit ?? settings.limit);
-	const limit = Number.isFinite(requested) && requested >= 1 ? Math.min(MAX_LIMIT, requested) : Math.min(MAX_LIMIT, settings.limit);
+	const fallback = Number.isFinite(Math.trunc(settings.limit)) && settings.limit >= 1 ? settings.limit : spec.defaultLimit;
+	const limit = Number.isFinite(requested) && requested >= 1 ? Math.min(spec.maxLimit, requested) : Math.min(spec.maxLimit, fallback);
 	url.searchParams.set("limit", String(limit));
 	const page = options.page ?? settings.page ?? 1;
-	if (page > 1) url.searchParams.set("page", String(page));
+	// Only the paginated endpoints document `page`; shopping would reject it.
+	if (spec.paginated && page > 1) url.searchParams.set("page", String(page));
 	for (const [key, value] of Object.entries(settings.params)) {
 		if (!url.searchParams.has(key)) url.searchParams.set(key, value);
 	}
@@ -215,6 +281,7 @@ export async function search(settings: SearloSettings, query: string, options: S
 		throw new SearloError("no-key", "no Searlo API key configured — run /searlo login or set the key in searlo.json");
 	}
 
+	const vertical = options.vertical ?? settings.vertical ?? "web";
 	const url = buildSearchUrl(settings, trimmed, options);
 	const started = Date.now();
 	const timeout = AbortSignal.timeout(settings.timeoutMs);
@@ -248,7 +315,7 @@ export async function search(settings: SearloSettings, query: string, options: S
 		const head = text.trimStart().slice(0, 40);
 		throw new SearloError(
 			"shape",
-			`expected JSON from ${settings.baseUrl}${settings.endpoint}, got ${head.startsWith("<") ? "HTML" : "non-JSON"}: ${excerpt(text)}`,
+			`expected JSON from ${settings.baseUrl}${endpointFor(settings, vertical)}, got ${head.startsWith("<") ? "HTML" : "non-JSON"}: ${excerpt(text)}`,
 		);
 	}
 	const payload = parsed.value;
@@ -260,10 +327,11 @@ export async function search(settings: SearloSettings, query: string, options: S
 		throw new SearloError("api", `Searlo reported success:false — ${message}`, response.status);
 	}
 
-	const rawItems = extractItems(payload);
+	const rawItems = extractItems(payload, vertical);
 	const first = rawItems[0];
 	return {
 		query: trimmed,
+		vertical,
 		url,
 		status: response.status,
 		elapsedMs,

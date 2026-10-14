@@ -26,6 +26,13 @@ interface Stub {
 	active: string[];
 	notifications: { message: string; type?: string }[];
 	sentUserMessages: string[];
+	/** Key bindings the extension asked for, in registration order. */
+	shortcuts: { key: string; description?: string }[];
+	/** Last status text per footer slot key. */
+	status: Record<string, string | undefined>;
+	/** Scripted answers for ctx.ui.select, consumed in order. */
+	selectQueue: string[];
+	selectTitles: string[];
 	pi: ExtensionAPI;
 	ctx: any;
 }
@@ -38,6 +45,10 @@ function makeStub(): Stub {
 		active: ["read", "bash"],
 		notifications: [],
 		sentUserMessages: [],
+		shortcuts: [],
+		status: {},
+		selectQueue: [],
+		selectTitles: [],
 		pi: undefined as unknown as ExtensionAPI,
 		ctx: {},
 	};
@@ -46,6 +57,11 @@ function makeStub(): Stub {
 		registerTool: (tool: any) => stub.tools.push(tool),
 		registerCommand: (name: string, def: any) => {
 			stub.commands[name] = def;
+		},
+		registerShortcut: (key: string, options: any) => {
+			stub.shortcuts.push({ key, description: options?.description });
+			stub.handlers[`shortcut:${key}`] ??= [];
+			stub.handlers[`shortcut:${key}`].push(options.handler);
 		},
 		on: (event: string, handler: any) => {
 			stub.handlers[event] ??= [];
@@ -70,7 +86,13 @@ function makeStub(): Stub {
 			notify: (message: string, type?: string) => stub.notifications.push({ message, type }),
 			input: async () => undefined,
 			confirm: async () => true,
-			select: async () => undefined,
+			select: async (title: string, _options: string[]) => {
+				stub.selectTitles.push(title);
+				return stub.selectQueue.shift();
+			},
+			setStatus: (key: string, text: string | undefined) => {
+				stub.status[key] = text;
+			},
 		},
 	};
 	return stub;
@@ -118,6 +140,251 @@ function cleanup() {
 	rmSync(agentDir, { recursive: true, force: true });
 	delete process.env.PI_CODING_AGENT_DIR;
 }
+
+test("binds the picker to f3 by default and to the configured key", () => {
+	useConfig({ mode: "tool" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		assert.deepEqual(stub.shortcuts.map((binding) => binding.key), ["f3"]);
+		assert.match(stub.shortcuts[0].description ?? "", /mode and search type/);
+	} finally {
+		cleanup();
+	}
+
+	useConfig({ mode: "tool", shortcut: "ctrl+g" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		assert.deepEqual(stub.shortcuts.map((binding) => binding.key), ["ctrl+g"]);
+	} finally {
+		cleanup();
+	}
+
+	// An unusable binding must not stop the rest of the extension from loading.
+	useConfig({ mode: "tool", shortcut: "not a key" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		assert.deepEqual(stub.shortcuts.map((binding) => binding.key), ["f3"], "falls back to the default binding");
+		assert.ok(stub.tools.length > 0, "the tool still registers");
+	} finally {
+		cleanup();
+	}
+});
+
+test("the bottom bar shows the search type only while searching is enabled", async () => {
+	useConfig({ mode: "tool" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+		assert.equal(stub.status["searlo"], "Searlo: Web");
+
+		await stub.commands["searlo"].handler("vertical images", stub.ctx);
+		assert.equal(stub.status["searlo"], "Searlo: Image");
+
+		await stub.commands["searlo"].handler("vertical videos", stub.ctx);
+		assert.equal(stub.status["searlo"], "Searlo: Video");
+
+		await stub.commands["searlo"].handler("off", stub.ctx);
+		assert.equal(stub.status["searlo"], undefined, "manual mode shows nothing");
+
+		await stub.commands["searlo"].handler("auto", stub.ctx);
+		assert.equal(stub.status["searlo"], "Searlo: Video", "auto shows the current type");
+	} finally {
+		cleanup();
+	}
+});
+
+test("showStatus: false hides the bottom bar even when enabled", async () => {
+	useConfig({ mode: "tool", showStatus: false });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+		assert.equal(stub.status["searlo"], undefined);
+		assert.deepEqual(stub.active, ["read", "bash", "searlo_search"], "hiding the label does not disable searching");
+	} finally {
+		cleanup();
+	}
+});
+
+test("session_shutdown clears the status slot", async () => {
+	useConfig({ mode: "tool" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+		assert.equal(stub.status["searlo"], "Searlo: Web");
+		await fire(stub, "session_shutdown", { reason: "quit" });
+		assert.equal(stub.status["searlo"], undefined);
+	} finally {
+		cleanup();
+	}
+});
+
+test("the F3 picker marks the current choice and switches mode and search type", async () => {
+	useConfig({ mode: "tool" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+
+		const binding = stub.handlers["shortcut:f3"][0];
+		stub.selectQueue = ["● Model decides (searches on demand)"];
+		await binding(stub.ctx);
+		assert.equal(stub.active.includes("searlo_search"), true, "re-picking the current mode changes nothing");
+
+		stub.selectQueue = ["◆  Change search type…", "○ images"];
+		await binding(stub.ctx);
+		assert.equal(stub.status["searlo"], "Searlo: Image");
+		assert.match(stub.selectTitles.at(-1) ?? "", /currently Web/);
+
+		stub.selectQueue = ["○ Inject into every matching prompt"];
+		await binding(stub.ctx);
+		assert.equal(stub.status["searlo"], "Searlo: Image", "the search type survives a mode change");
+		const injected = await fire(stub, "before_agent_start", {
+			messageType: "user",
+			prompt: "what is the latest node lts release today",
+		});
+		assert.ok(injected[0]?.message, "the picker choice actually turned injection on");
+		assert.equal(stub.selectQueue.length, 0, "every scripted answer was consumed");
+	} finally {
+		cleanup();
+	}
+});
+
+test("a cancelled picker changes nothing", async () => {
+	useConfig({ mode: "tool" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+
+		await stub.handlers["shortcut:f3"][0](stub.ctx);
+		assert.equal(stub.status["searlo"], "Searlo: Web");
+		assert.deepEqual(stub.active, ["read", "bash", "searlo_search"]);
+	} finally {
+		cleanup();
+	}
+});
+
+test("the picker explains itself when there is no UI to show it in", async () => {
+	useConfig({ mode: "tool" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+
+		stub.ctx.hasUI = false;
+		await stub.handlers["shortcut:f3"][0](stub.ctx);
+		assert.match(stub.notifications.map((note) => note.message).join(" "), /interactive session/);
+	} finally {
+		cleanup();
+	}
+});
+
+test("/searlo <vertical>: <query> sends one shot searches to that endpoint", async () => {
+	useConfig({ mode: "tool" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+
+		await stub.commands["searlo"].handler("images: sunset lamp", stub.ctx);
+		assert.match(requests.at(-1) ?? "", /^\/api\/v1\/search\/images\?/);
+		assert.match(stub.sentUserMessages.at(-1) ?? "", /vertical="images"/);
+
+		await stub.commands["searlo"].handler("news: tech", stub.ctx);
+		assert.match(requests.at(-1) ?? "", /^\/api\/v1\/search\/news\?/);
+
+		// A query whose first word merely matches a vertical keeps that word: no silent truncation.
+		requests = [];
+		await stub.commands["searlo"].handler("web application security best practices", stub.ctx);
+		assert.match(requests.at(-1) ?? "", /q=web\+application\+security/, "the word stays in the query");
+
+		await stub.commands["searlo"].handler("test images: sunset", stub.ctx);
+		assert.match(requests.at(-1) ?? "", /\/api\/v1\/search\/images\?/, "test honours a vertical prefix too");
+	} finally {
+		cleanup();
+	}
+});
+
+test("the model can choose the vertical per search", async () => {
+	useConfig({ mode: "tool" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+
+		await stub.tools[0].execute("tc1", { query: "wireless earbuds", vertical: "shopping", limit: 40 }, undefined, undefined, {
+			cwd: process.cwd(),
+		});
+		assert.match(requests.at(-1) ?? "", /limit=40/, "shopping accepts more results than the other verticals");
+		assert.match(requests.at(-1) ?? "", /^\/api\/v1\/search\/shopping\?/);
+	} finally {
+		cleanup();
+	}
+});
+
+test("an unknown vertical from the model falls back to the configured one", async () => {
+	useConfig({ mode: "tool" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+		await stub.tools[0].execute("tc1", { query: "sunset", vertical: "gifs" }, undefined, undefined, { cwd: process.cwd() });
+		assert.match(requests.at(-1) ?? "", /^\/api\/v1\/search\/web\?/);
+	} finally {
+		cleanup();
+	}
+});
+
+test("/searlo vertical <name> switches the default search type", async () => {
+	useConfig({ mode: "tool" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+
+		await stub.commands["searlo"].handler("vertical shopping", stub.ctx);
+		await stub.commands["searlo"].handler("wireless earbuds", stub.ctx);
+		assert.match(requests.at(-1) ?? "", /\/api\/v1\/search\/shopping\?/, "the session default moved");
+
+		// A new session reads the file again, so the unsaved switch is gone.
+		await fire(stub, "session_start", {});
+		requests = [];
+		await stub.commands["searlo"].handler("wireless earbuds", stub.ctx);
+		assert.match(requests.at(-1) ?? "", /\/api\/v1\/search\/web\?/);
+
+		await stub.commands["searlo"].handler("vertical nonsense", stub.ctx);
+		assert.match(stub.notifications.at(-1)?.message ?? "", /usage: \/searlo vertical/);
+	} finally {
+		cleanup();
+	}
+});
+
+test("/searlo vertical <name> --save persists the search type", async () => {
+	useConfig({ mode: "tool" });
+	try {
+		const stub = makeStub();
+		searloExtension(stub.pi);
+		await fire(stub, "session_start", {});
+
+		await stub.commands["searlo"].handler("vertical news --save", stub.ctx);
+		const stored = JSON.parse(readFileSync(join(agentDir, "searlo.json"), "utf8")) as Record<string, unknown>;
+		assert.equal(stored["vertical"], "news");
+		assert.equal(stored["apiKey"], "sk_wired_key_1234", "saving the vertical keeps the key");
+
+		requests = [];
+		await fire(stub, "session_start", {});
+		await stub.commands["searlo"].handler("tech", stub.ctx);
+		assert.match(requests.at(-1) ?? "", /\/api\/v1\/search\/news\?/, "a later session uses the saved vertical");
+	} finally {
+		cleanup();
+	}
+});
 
 test("registers the tool and the /searlo command on load", () => {
 	useConfig();

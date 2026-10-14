@@ -15,23 +15,111 @@ import { dirname, join, resolve } from "node:path";
 
 export const CONFIG_BASENAME = "searlo.json";
 export const DEFAULT_API_KEY_ENV = "SEARLO_API_KEY";
-/** The API rejects limit > 10 with HTTP 400 VALIDATION_ERROR. */
+/** Path overrides from searlo.json, e.g. if Searlo renames an endpoint. */
+export function defaultEndpoints(): Record<SearchVertical, string> {
+	const paths = {} as Record<SearchVertical, string>;
+	for (const name of VERTICAL_NAMES) paths[name] = VERTICALS[name].path;
+	return paths;
+}
+
+/** The API rejects limit above the vertical ceiling with HTTP 400 VALIDATION_ERROR. */
 export const MAX_LIMIT = 10;
 
 export type SearloMode = "manual" | "tool" | "auto";
 
+/** The five Searlo search endpoints. */
+export type SearchVertical = "web" | "images" | "news" | "videos" | "shopping";
+
+export interface VerticalSpec {
+	/** Default path appended to baseUrl. */
+	readonly path: string;
+	readonly minLimit: number;
+	/** Each endpoint publishes its own ceiling: shopping accepts 55, the rest 10. */
+	readonly maxLimit: number;
+	/** What we ask for when the user configured no limit for this vertical. */
+	readonly defaultLimit: number;
+	/** Only this endpoint documents a page parameter. */
+	readonly paginated: boolean;
+	/** Envelope keys that may hold the list, in preference order. */
+	readonly listKeys: readonly string[];
+	/** Singular label used in model-facing output, e.g. "product listing". */
+	readonly itemLabel: string;
+}
+
+export const VERTICALS: Record<SearchVertical, VerticalSpec> = {
+	web: {
+		path: "/api/v1/search/web",
+		minLimit: 1,
+		maxLimit: 10,
+		defaultLimit: 5,
+		paginated: true,
+		listKeys: ["items", "results", "organic", "web", "data"],
+		itemLabel: "result",
+	},
+	images: {
+		path: "/api/v1/search/images",
+		minLimit: 1,
+		maxLimit: 10,
+		defaultLimit: 8,
+		paginated: true,
+		listKeys: ["items", "results", "images"],
+		itemLabel: "image",
+	},
+	news: {
+		path: "/api/v1/search/news",
+		minLimit: 1,
+		maxLimit: 10,
+		defaultLimit: 8,
+		paginated: true,
+		listKeys: ["items", "results", "news"],
+		itemLabel: "article",
+	},
+	videos: {
+		path: "/api/v1/search/videos",
+		minLimit: 1,
+		maxLimit: 10,
+		defaultLimit: 8,
+		paginated: true,
+		listKeys: ["items", "results", "videos"],
+		itemLabel: "video",
+	},
+	shopping: {
+		path: "/api/v1/search/shopping",
+		minLimit: 1,
+		maxLimit: 55,
+		defaultLimit: 12,
+		paginated: false,
+		listKeys: ["shopping", "items", "results"],
+		itemLabel: "product",
+	},
+};
+
+export const VERTICAL_NAMES = Object.keys(VERTICALS) as SearchVertical[];
+
+export function isVertical(value: unknown): value is SearchVertical {
+	return typeof value === "string" && Object.hasOwn(VERTICALS, value);
+}
+
+export function verticalSpec(vertical: SearchVertical): VerticalSpec {
+	return VERTICALS[vertical];
+}
+
 export interface SearloSettings {
 	/** Searlo API root, no trailing slash, e.g. https://api.searlo.tech */
 	baseUrl: string;
-	/** Search path appended to baseUrl. */
-	endpoint: string;
+	/** Endpoint path per vertical. */
+	endpoints: Record<SearchVertical, string>;
+	/** Deprecated single-path form; still accepted and applied to the vertical it names. */
+	endpoint?: string;
+	/** Vertical used when a search does not name one. */
+	vertical: SearchVertical;
 	/** Environment variable holding the API key. */
 	apiKeyEnv: string;
 	/** Key literal, or "env:VARNAME" to read process.env.VARNAME. */
 	apiKey?: string;
 	/** Header carrying the key. */
 	apiKeyHeader: string;
-	/** Result count requested from the API (1-MAX_LIMIT). */
+	/** Result count requested from the API, clamped to the vertical's ceiling. */
 	limit: number;
 	/** 1-based page for the documented `page` parameter; 1 is never sent. */
 	page?: number;
@@ -45,6 +133,10 @@ export interface SearloSettings {
 	contentBudgetChars: number;
 	/** Emit the citation/rules preamble in search context blocks. */
 	includeCitations: boolean;
+	/** Shortcut that opens the Searlo picker. Any pi KeyId, e.g. "f3", "ctrl+g", "alt+s". */
+	shortcut: string;
+	/** Show "Searlo: <vertical>" in the bottom bar whenever searching is enabled. */
+	showStatus: boolean;
 	/** Regex/validation problems found while loading. Never contains secrets. */
 	errors?: string[];
 	/** Only used when mode is "auto". */
@@ -60,7 +152,8 @@ export interface SearloSettings {
 
 export const DEFAULT_SETTINGS: SearloSettings = {
 	baseUrl: "https://api.searlo.tech",
-	endpoint: "/api/v1/search/web",
+	endpoints: defaultEndpoints(),
+	vertical: "web",
 	apiKeyEnv: DEFAULT_API_KEY_ENV,
 	apiKeyHeader: "x-api-key",
 	limit: 5,
@@ -70,6 +163,8 @@ export const DEFAULT_SETTINGS: SearloSettings = {
 	mode: "tool",
 	contentBudgetChars: 6000,
 	includeCitations: true,
+	shortcut: "f3",
+	showStatus: true,
 	auto: {
 		triggerPatterns: [
 			"\\b(latest|recent|currently|today|yesterday|this (week|month|year))\\b",
@@ -146,6 +241,39 @@ function clampInt(value: number | undefined, fallback: number, min: number, max:
 	return Math.min(max, Math.max(min, parsed));
 }
 
+/** Endpoint paths per vertical, with the documented defaults, tolerating junk or legacy `endpoint`. */
+function normalizeEndpoints(
+	value: unknown,
+	legacy: unknown,
+	vertical: SearchVertical,
+	errors: string[],
+): Record<SearchVertical, string> {
+	const endpoints = defaultEndpoints();
+	const layer = value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+	for (const name of VERTICAL_NAMES) {
+		const raw = layer[name];
+		if (typeof raw !== "string" || !raw.trim()) continue;
+		const path = raw.trim();
+		endpoints[name] = path.startsWith("/") ? path : `/${path}`;
+	}
+	// searlo.json written before verticals used a single `endpoint`, which applied to the active vertical.
+	if (typeof legacy === "string" && legacy.trim() && layer[vertical] === undefined) {
+		const path = legacy.trim();
+		endpoints[vertical] = path.startsWith("/") ? path : `/${path}`;
+	}
+	for (const key of Object.keys(layer)) {
+		if (!isVertical(key)) errors.push(`endpoints.${key} is not a known search vertical, ignored`);
+	}
+	return endpoints;
+}
+
+function normalizeVertical(value: unknown, errors: string[]): SearchVertical {
+	if (value === undefined) return DEFAULT_SETTINGS.vertical;
+	if (isVertical(value)) return value;
+	errors.push(`vertical "${String(value)}" is not one of ${VERTICAL_NAMES.join("|")}, using "${DEFAULT_SETTINGS.vertical}"`);
+	return DEFAULT_SETTINGS.vertical;
+}
+
 function stringList(value: unknown, fallback: string[]): string[] {
 	if (!Array.isArray(value)) return [...fallback];
 	return value.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0);
@@ -160,26 +288,49 @@ function toStringParams(value: unknown): Record<string, string> {
 	return params;
 }
 
+/**
+ * Loose KeyId validation: pi owns the real grammar (and terminal support varies), so we only
+ * reject obvious junk and let a bad binding surface as a registration error at startup.
+ */
+function normalizeShortcut(value: unknown): string {
+	if (typeof value !== "string") return DEFAULT_SETTINGS.shortcut;
+	const trimmed = value.trim().toLowerCase();
+	if (!/^(?:(?:ctrl|shift|alt|cmd|super|meta)(?:[-+][a-z0-9]+|\+[a-z]+)|f(?:1[0-2]|[1-9])|[a-z0-9]|escape|esc|enter|tab|space|backspace|delete|insert|home|end|pageup|pagedown|up|down|left|right)(?:[-+][a-z0-9]+)*$/i.test(trimmed)) {
+		return DEFAULT_SETTINGS.shortcut;
+	}
+	return trimmed;
+}
+
+function normalizeBool(value: unknown, fallback: boolean): boolean {
+	return typeof value === "boolean" ? value : fallback;
+}
+
 function normalize(settings: SearloSettings): SearloSettings {
 	const baseUrl = String(settings.baseUrl ?? "").trim().replace(/\/+$/, "") || DEFAULT_SETTINGS.baseUrl;
-	const endpointRaw = String(settings.endpoint ?? "").trim() || DEFAULT_SETTINGS.endpoint;
 	const errors = settings.errors ?? [];
 	const check = validPattern(errors);
 	const mode = settings.mode;
+	const vertical = normalizeVertical(settings.vertical, errors);
+	const endpoints = normalizeEndpoints(settings.endpoints, settings.endpoint, settings.vertical ?? DEFAULT_SETTINGS.vertical, errors);
+	const spec = verticalSpec(vertical);
+	const limit = clampInt(settings.limit, spec.defaultLimit, spec.minLimit, spec.maxLimit);
 	return {
 		...settings,
 		errors,
 		baseUrl,
-		endpoint: endpointRaw.startsWith("/") ? endpointRaw : `/${endpointRaw}`,
+		endpoints,
+		vertical,
 		apiKeyEnv: String(settings.apiKeyEnv ?? "").trim() || DEFAULT_SETTINGS.apiKeyEnv,
 		apiKeyHeader: String(settings.apiKeyHeader ?? "").trim() || DEFAULT_SETTINGS.apiKeyHeader,
-		limit: clampInt(settings.limit, DEFAULT_SETTINGS.limit, 1, MAX_LIMIT),
+		limit,
 		timeoutMs: clampInt(settings.timeoutMs, DEFAULT_SETTINGS.timeoutMs, 500, 120000),
 		contentBudgetChars: clampInt(settings.contentBudgetChars, DEFAULT_SETTINGS.contentBudgetChars, 500, 200000),
 		params: toStringParams(settings.params),
 		page: clampInt(settings.page, 1, 1, 100),
 		mode: mode === "manual" || mode === "tool" || mode === "auto" ? mode : DEFAULT_SETTINGS.mode,
 		includeCitations: settings.includeCitations !== false,
+		shortcut: normalizeShortcut(settings.shortcut),
+		showStatus: normalizeBool(settings.showStatus, true),
 		auto: {
 			triggerPatterns: stringList(settings.auto?.triggerPatterns, DEFAULT_SETTINGS.auto.triggerPatterns).filter(check),
 			skipPatterns: stringList(settings.auto?.skipPatterns, DEFAULT_SETTINGS.auto.skipPatterns).filter(check),
@@ -303,12 +454,21 @@ export function defaultConfigTemplate(): string {
 		baseUrl: DEFAULT_SETTINGS.baseUrl,
 		apiKey: `env:${DEFAULT_API_KEY_ENV}`,
 		apiKeyHeader: DEFAULT_SETTINGS.apiKeyHeader,
-		endpoint: DEFAULT_SETTINGS.endpoint,
+		// web | images | news | videos | shopping — the vertical used when a search names none.
+		vertical: DEFAULT_SETTINGS.vertical,
+		// Per-vertical paths, only needed if Searlo renames an endpoint.
+		endpoints: defaultEndpoints(),
+		// "tool" lets the model search, "auto" injects into every matching prompt, "manual" is /searlo only.
+		mode: "tool",
+		// Opens the mode/vertical picker; any pi KeyId works, e.g. "ctrl+g".
+		shortcut: "f3",
+		showStatus: true,
 		limit: 5,
 		timeoutMs: 8000,
-		mode: "tool",
 		contentBudgetChars: 6000,
-		params: { language: "en", safesearch: "1" },
+		// Passed through verbatim: gl/hl for locale, size for images,
+		// safe for videos.
+		params: { hl: "en", gl: "us" },
 	};
 	return `${JSON.stringify(template, null, "\t")}\n`;
 }

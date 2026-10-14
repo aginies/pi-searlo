@@ -30,9 +30,12 @@ pi package install <your-scope>/pi-searlo
 {
 	"baseUrl": "https://api.searlo.tech",
 	"apiKey": "env:SEARLO_API_KEY",
+	"vertical": "web",
 	"limit": 5,
 	"timeoutMs": 8000,
 	"mode": "tool",
+	"shortcut": "f3",
+	"showStatus": true,
 	"params": { "gl": "us", "hl": "en" }
 }
 ```
@@ -51,6 +54,56 @@ model-facing text, tool results, notifications, or logs.
 A project `.pi/searlo.json` may tune `baseUrl`, `limit`, `params`, `mode` and budgets, but its
 `apiKey`, `apiKeyEnv` and `apiKeyHeader` fields are ignored — a repository you clone cannot redirect
 your credentials or swap in its own key header.
+
+## Search types (verticals)
+
+| Vertical | Endpoint | `limit` | `page` | Extra params | Bottom bar |
+|---|---|---|---|---|---|
+| `web` | `/api/v1/search/web` | 1-10 | yes | `gl`, `hl` | `Searlo: Web` |
+| `images` | `/api/v1/search/images` | 1-10 | yes | `size` = small/medium/large/xlarge | `Searlo: Image` |
+| `news` | `/api/v1/search/news` | 1-10 | yes | `gl`, `hl` | `Searlo: News` |
+| `videos` | `/api/v1/search/videos` | 1-10 | yes | `safe` = active/off | `Searlo: Video` |
+| `shopping` | `/api/v1/search/shopping` | **1-55** | **no** | `gl`, `hl` | `Searlo: Shopping` |
+
+Four ways to pick one. The one-shot form needs the colon, so a query that merely starts with a
+vertical word is not truncated: `/searlo web application security` searches the phrase
+`web application security`, while `/searlo web: application security` searches `application security`
+on the web endpoint.
+
+```text
+/searlo images: sunset lamp       one shot: search images and use the results
+/searlo vertical shopping         this session's default (add --save to persist it)
+"vertical": "news"                searlo.json default
+searlo_search { vertical: … }     the model chooses per search
+```
+
+Vertical-specific fields are normalized into each item: images carry `image.src`, `thumbnail`,
+`width`/`height` and the hosting `contextLink`; news carries `news.source`/`publishedDate`/`author`;
+shopping carries `price` and the store `source`. The context block adds rules per vertical —
+for shopping it says a listing is advertising copy and prices may have moved, for images it says to
+link the file and page rather than the thumbnail.
+
+`shopping` uses a different envelope (`{ success, searchParameters, shopping: [...], source }`) and
+answers 503 with `retryable: true` when upstream blocks it; empty results are a `200` with
+`shopping: []`, which is reported as "no results", not an error.
+
+## F3 picker and the bottom bar
+
+`"shortcut"` (default `f3`, any pi `KeyId` such as `ctrl+g`) opens a picker that marks the current
+choice, so "which one is selected" is answerable at a glance:
+
+```text
+Searlo
+● Model decides (searches on demand)
+○ Inject into every matching prompt
+○ Off (only /searlo searches)
+◆  Change search type…          → web | images | news | videos | shopping
+```
+
+Choosing `Off` is the same as `/searlo off`. While searching is enabled the built-in footer shows
+`Searlo: <type>`; it disappears in manual mode, and `"showStatus": false` hides it entirely without
+disabling search. Shortcuts cannot be re-registered at runtime, so changing `shortcut` needs a pi
+restart or `/reload`.
 
 ## Three ways to use it
 
@@ -83,8 +136,10 @@ token. Its triggers are configurable (`auto.triggerPatterns`, `auto.skipPatterns
 ```text
 /searlo                   status: mode, key source (masked), endpoint
 /searlo <query>           search now and use the results to answer <query>
+/searlo <vertical>: <query>  one shot in that vertical: web|images|news|videos|shopping
 /searlo auto | on | off   per-session toggle: injection on / model tool / fully manual
 /searlo default <mode>    persist manual|tool|auto into searlo.json for new sessions
+/searlo vertical <name> [--save]  search type for this session, or persisted with --save
 /searlo test [query]      one search, with latency, cache HIT/MISS and credits remaining
 /searlo raw [query]       print the field names of the first raw item (shape diagnosis)
 /searlo config            effective settings and which files contributed them
@@ -122,6 +177,7 @@ Everything degrades to "no search happened" rather than blocking your turn:
 | HTTP 401/403 | `auth` error naming the status, the key is never echoed |
 | HTTP 400 `VALIDATION_ERROR` | `api` error quoting `code`, `message` and the offending field, not the raw JSON body |
 | HTTP 429 | `rate-limit` error, so callers can back off |
+| HTTP 503 `retryable: true` (shopping) | `http` error stating the upstream is temporarily blocked |
 | `success: false` in a 200 body | `api` error carrying the API's own message |
 | HTML or truncated body instead of JSON | `shape` error stating what was received |
 | timeout (`timeoutMs`) | `timeout` error; auto mode just skips retrieval |
@@ -141,7 +197,7 @@ src/index.ts    pi wiring: tool, commands, session/mode handling, auto retrieval
 src/config.ts   searlo.json loading, clamping, key resolution, key storage
 src/client.ts   the Searlo HTTP call, envelope + header parsing, error kinds
 src/format.ts   the model-facing context block, budgets, summaries
-test/           48 node:test cases: a mock Searlo server, config loading, and a
+test/           72 node:test cases: a mock Searlo server, config loading, and a
                 stub ExtensionAPI harness that drives tool calls, modes and injection
 ```
 
