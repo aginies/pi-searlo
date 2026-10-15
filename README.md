@@ -81,13 +81,17 @@ your credentials or swap in its own key header.
 
 ## Search types (verticals)
 
-| Vertical | Endpoint | `limit` | `page` | Extra params | Bottom bar |
-|---|---|---|---|---|---|
-| `web` | `/api/v1/search/web` | 1-10 | yes | `gl`, `hl` | `Searlo: Web` |
-| `images` | `/api/v1/search/images` | 1-10 | yes | `size` = small/medium/large/xlarge | `Searlo: Image` |
-| `news` | `/api/v1/search/news` | 1-10 | yes | `gl`, `hl` | `Searlo: News` |
-| `videos` | `/api/v1/search/videos` | 1-10 | yes | `safe` = active/off | `Searlo: Video` |
-| `shopping` | `/api/v1/search/shopping` | **1-55** | **no** | `gl`, `hl` | `Searlo: Shopping` |
+| Vertical | Endpoint | `limit` | `page` | Bottom bar |
+|---|---|---|---|---|
+| `web` | `/api/v1/search/web` | 1-10 | yes | `Searlo: Web` |
+| `images` | `/api/v1/search/images` | 1-10 | yes | `Searlo: Image` |
+| `news` | `/api/v1/search/news` | 1-10 | yes | `Searlo: News` |
+| `videos` | `/api/v1/search/videos` | 1-10 | yes | `Searlo: Video` |
+| `shopping` | `/api/v1/search/shopping` | **1-55** | **no** | `Searlo: Shopping` |
+| `scholar` | `/api/v1/search/scholar` | 1-10 | yes | `Searlo: Scholar` |
+| `patents` | `/api/v1/search/patents` | 1-10 | yes | `Searlo: Patents` |
+| `site` | `/api/v1/search/site` | 1-10 | yes | `Searlo: Site` |
+| `maps` | `/api/v1/search/maps` | 1-10 | **no** | `Searlo: Maps` |
 
 Four ways to pick one. The one-shot form needs the colon, so a query that merely starts with a
 vertical word is not truncated: `/searlo web application security` searches the phrase
@@ -103,9 +107,11 @@ searlo_search { vertical: … }     the model chooses per search
 
 Vertical-specific fields are normalized into each item: images carry `image.src`, `thumbnail`,
 `width`/`height` and the hosting `contextLink`; news carries `news.source`/`publishedDate`/`author`;
-shopping carries `price` and the store `source`. The context block adds rules per vertical —
-for shopping it says a listing is advertising copy and prices may have moved, for images it says to
-link the file and page rather than the thumbnail.
+shopping carries `price` and the store `source`; scholar carries `authors`, `venue`, `year`, `citations`;
+patents carry `patentNumber`, `assignee`, `date`; maps carry `address`, `rating`, `reviewCount`,
+`hours`, `isOpen`. The context block adds rules per vertical — for shopping it says a listing is
+advertising copy and prices may have moved, for images it says to link the file and page rather than
+the thumbnail, for maps it says to cite name, address, rating, and hours.
 
 `shopping` uses a different envelope (`{ success, searchParameters, shopping: [...], source }`) and
 answers 503 with `retryable: true` when upstream blocks it; empty results are a `200` with
@@ -122,7 +128,7 @@ Searlo
 ○ Inject into every matching prompt
 ○ Manual (only /searlo searches)
 ○ Off (no Searlo searches)
-◆  Change search type…          → web | images | news | videos | shopping
+◆  Change search type…          → web | images | news | videos | shopping | scholar | patents | site | maps
 ◆  Change output format…        → text | toon
 ```
 
@@ -136,6 +142,7 @@ a pi restart or `/reload`.
 | Command / mode | Who decides to search | What happens |
 |---|---|---|
 | `/searlo <query>` | you, explicitly | searches and injects the results plus your question as the next turn |
+| `/searlo batch q1 q2` | you, explicitly | runs multiple queries in parallel, injects all results |
 | `"mode": "tool"` (default) | the model | `searlo_search` is active, so pi calls it when it needs fresh data |
 | `"mode": "auto"` | a regex heuristic | retrieval runs before the turn starts and is added as hidden context |
 | `"mode": "manual"` | nobody, but you | no injection and the tool is withdrawn; `/searlo <query>` still searches |
@@ -193,7 +200,12 @@ reported as a warning and the turn continues unsearched — auto mode never bloc
 ```text
 /searlo                   status: mode, key source (masked), endpoint
 /searlo <query>           search now and use the results to answer <query>
-/searlo <vertical>: <query>  one shot in that vertical: web|images|news|videos|shopping
+/searlo <vertical>: <query>  one shot in that vertical: web|images|news|videos|shopping|scholar|patents|site|maps
+/searlo batch <q1> <q2>…  run multiple queries in parallel, inject all results
+/searlo history           show last 10 searches
+/searlo replay <index>    re-run a previous search by index
+/searlo site <domain>: <query>  search within a single domain
+/searlo read <url>        extract text from a web page
 /searlo auto|on|manual|off  per-session toggle: injection / model tool / hand-run only / nothing
 /searlo default <mode>    persist off|manual|tool|auto into searlo.json for new sessions
 /searlo toon [on|off] [--save]  hand the model a TOON table instead of the text list
@@ -304,7 +316,7 @@ src/index.ts    pi wiring: tool, commands, session/mode handling, auto retrieval
 src/config.ts   searlo.json loading, clamping, key resolution, key storage
 src/client.ts   the Searlo HTTP call, envelope + header parsing, error kinds
 src/format.ts   the model-facing context block, budgets, summaries
-test/           72 node:test cases: a mock Searlo server, config loading, and a
+test/           107 node:test cases: a mock Searlo server, config loading, and a
                 stub ExtensionAPI harness that drives tool calls, modes and injection
 ```
 

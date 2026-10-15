@@ -36,6 +36,12 @@ export interface SearchResultItem {
 	news?: SearchNewsArticle;
 	/** Shopping vertical, e.g. "$79.99". */
 	price?: string;
+	/** Scholar vertical. */
+	scholar?: SearchScholarItem;
+	/** Patents vertical. */
+	patents?: SearchPatentItem;
+	/** Maps/Places vertical. */
+	maps?: SearchMapsItem;
 }
 
 export interface SearchImage {
@@ -53,6 +59,90 @@ export interface SearchNewsArticle {
 	author?: string;
 }
 
+export interface SearchScholarItem {
+	/** Paper title. */
+	title: string;
+	/** Direct URL to the paper or landing page. */
+	url: string;
+	/** Authors as a comma-separated string or an array joined with ", ". */
+	authors?: string;
+	/** Venue or journal name, e.g. "NeurIPS 2024". */
+	venue?: string;
+	/** Publication year. */
+	year?: string;
+	/** Number of citations, if reported. */
+	citations?: number;
+	/** Short abstract or summary. */
+	abstract?: string;
+	/** The endpoint's own snippet field, kept for fallback. */
+	snippet?: string;
+	/** Source domain, e.g. "arxiv.org". */
+	source?: string;
+}
+
+export interface SearchPatentItem {
+	/** Patent number, e.g. "US11234567B2". */
+	patentNumber?: string;
+	/** Patent title. */
+	title: string;
+	/** Direct URL to the patent page. */
+	url: string;
+	/** Inventors as a comma-separated string. */
+	inventors?: string;
+	/** Assignee / owner company or institution. */
+	assignee?: string;
+	/** Filing or grant date. */
+	date?: string;
+	/** Abstract or summary. */
+	abstract?: string;
+	/** The endpoint's own snippet field, kept for fallback. */
+	snippet?: string;
+	/** Source domain. */
+	source?: string;
+}
+
+export interface SearchMapsItem {
+	/** Business or place name. */
+	title: string;
+	/** Direct URL to the Google Maps listing. */
+	url: string;
+	/** Full street address. */
+	address?: string;
+	/** Average rating (e.g. 4.5). */
+	rating?: number;
+	/** Number of reviews. */
+	reviewCount?: number;
+	/** Price level: 1-4 ($ to $$$$). */
+	priceLevel?: number;
+	/** Business category, e.g. "Italian restaurant". */
+	category?: string;
+	/** Phone number. */
+	phone?: string;
+	/** Business hours, e.g. "Open · Closes 10 PM". */
+	hours?: string;
+	/** Whether the place is currently open. */
+	isOpen?: boolean;
+	/** The endpoint's own snippet field, kept for fallback. */
+	snippet?: string;
+	/** Source domain. */
+	source?: string;
+}
+
+export interface WebpageResult {
+	/** The URL that was fetched. */
+	url: string;
+	/** Extracted page title. */
+	title?: string;
+	/** Main body text, stripped of HTML and navigation. */
+	content: string;
+	/** Word count of the extracted content. */
+	wordCount?: number;
+	/** Read time in minutes (approximate). */
+	readTime?: number;
+	/** Source domain. */
+	source?: string;
+}
+
 export interface SearchInformation {
 	totalResults?: string;
 	/** Seconds reported by the API, normalised to milliseconds. */
@@ -60,6 +150,8 @@ export interface SearchInformation {
 	query?: string;
 	currentPage?: number;
 	hasNextPage?: boolean;
+	/** Domain restricted to this site for /search/site results. */
+	site?: string;
 }
 
 export interface SearchAccount {
@@ -118,6 +210,20 @@ export class SearloError extends Error {
 	constructor(kind: SearloErrorKind, message: string, status?: number) {
 		super(message);
 		this.name = "SearloError";
+		this.kind = kind;
+		this.status = status;
+	}
+}
+
+/** Error kind specific to the webpage reader. */
+export type WebpageErrorKind = "no-key" | "auth" | "http" | "network" | "shape" | "timeout" | "url" | "api" | "rate-limit" | "insufficient-credits";
+
+export class WebpageError extends Error {
+	readonly kind: WebpageErrorKind;
+	readonly status?: number;
+	constructor(kind: WebpageErrorKind, message: string, status?: number) {
+		super(message);
+		this.name = "WebpageError";
 		this.kind = kind;
 		this.status = status;
 	}
@@ -199,6 +305,114 @@ function readNews(record: RecordLike): SearchNewsArticle | undefined {
 	return { source, publishedDate, author };
 }
 
+function readScholar(record: RecordLike): SearchScholarItem | undefined {
+	const nested = asRecord(record["scholar"]);
+	// Only create a scholar object when we find scholar-specific fields.
+	const hasScholarFields =
+		record["authors"] !== undefined ||
+		record["venue"] !== undefined ||
+		record["citations"] !== undefined ||
+		record["citationCount"] !== undefined ||
+		record["cited_by"] !== undefined ||
+		record["journal"] !== undefined ||
+		record["conference"] !== undefined ||
+		record["publicationYear"] !== undefined ||
+		record["abstract"] !== undefined ||
+		nested["authors"] !== undefined ||
+		nested["venue"] !== undefined ||
+		nested["citations"] !== undefined ||
+		nested["journal"] !== undefined ||
+		nested["conference"] !== undefined ||
+		nested["publicationYear"] !== undefined ||
+		nested["abstract"] !== undefined;
+	if (!hasScholarFields) return undefined;
+	const title = readString(record, TITLE_KEYS) ?? readString(nested, ["title"]); 
+	const url = readString(record, URL_KEYS) ?? readString(nested, ["url", "link"]); 
+	const authors = readString(record, ["authors", "author"]) ?? readString(nested, ["authors", "author"]);
+	const venue = readString(record, ["venue", "journal", "conference", "publication"]) ?? readString(nested, ["venue", "journal", "conference"]);
+	const year = readString(record, ["year", "publicationYear", "date"]) ?? readString(nested, ["year", "publicationYear"]);
+	const citations = readNumber(record, ["citations", "citationCount", "cited_by"]) ?? readNumber(nested, ["citations", "citationCount"]);
+	const abstract = readString(record, ["abstract", "summary", "description"]) ?? readString(nested, ["abstract", "summary"]);
+	const snippet = readString(record, SNIPPET_KEYS) ?? readString(nested, SNIPPET_KEYS);
+	const source = readString(record, SOURCE_KEYS) ?? readString(nested, SOURCE_KEYS);
+	if (!title && !url) return undefined;
+	return { title: title ?? "Untitled", url: url ?? "", authors, venue, year, citations, abstract, snippet, source };
+}
+
+function readPatents(record: RecordLike): SearchPatentItem | undefined {
+	const nested = asRecord(record["patents"]);
+	// Only create a patents object when we find patent-specific fields.
+	const hasPatentFields =
+		record["patentNumber"] !== undefined ||
+		record["patent_id"] !== undefined ||
+		record["publicationNumber"] !== undefined ||
+		record["inventors"] !== undefined ||
+		record["inventor"] !== undefined ||
+		record["assignee"] !== undefined ||
+		record["owner"] !== undefined ||
+		record["applicant"] !== undefined ||
+		record["filingDate"] !== undefined ||
+		record["grantDate"] !== undefined ||
+		record["fullTextUrl"] !== undefined ||
+		nested["patentNumber"] !== undefined ||
+		nested["patent_id"] !== undefined ||
+		nested["inventors"] !== undefined ||
+		nested["assignee"] !== undefined ||
+		nested["owner"] !== undefined ||
+		nested["applicant"] !== undefined ||
+		nested["filingDate"] !== undefined ||
+		nested["grantDate"] !== undefined;
+	if (!hasPatentFields) return undefined;
+	const title = readString(record, TITLE_KEYS) ?? readString(nested, ["title"]); 
+	const url = readString(record, URL_KEYS) ?? readString(nested, ["url", "link", "fullTextUrl"]); 
+	const patentNumber = readString(record, ["patentNumber", "number", "patent_id", "publicationNumber"]) ?? readString(nested, ["patentNumber", "number", "patent_id"]);
+	const inventors = readString(record, ["inventors", "inventor"]) ?? readString(nested, ["inventors", "inventor"]);
+	const assignee = readString(record, ["assignee", "owner", "applicant", "company"]) ?? readString(nested, ["assignee", "owner", "applicant"]);
+	const date = readString(record, ["date", "filingDate", "grantDate", "publicationDate", "year"]) ?? readString(nested, ["date", "filingDate", "grantDate", "publicationDate"]);
+	const abstract = readString(record, ["abstract", "summary", "description"]) ?? readString(nested, ["abstract", "summary"]);
+	const snippet = readString(record, SNIPPET_KEYS) ?? readString(nested, SNIPPET_KEYS);
+	const source = readString(record, SOURCE_KEYS) ?? readString(nested, SOURCE_KEYS);
+	if (!title && !url) return undefined;
+	return { title: title ?? "Untitled", url: url ?? "", patentNumber, inventors, assignee, date, abstract, snippet, source };
+}
+
+function readMaps(record: RecordLike): SearchMapsItem | undefined {
+	const nested = asRecord(record["maps"]);
+	// Only create a maps object when we find maps-specific fields.
+	const hasMapsFields =
+		record["address"] !== undefined ||
+		record["rating"] !== undefined ||
+		record["reviewCount"] !== undefined ||
+		record["priceLevel"] !== undefined ||
+		record["category"] !== undefined ||
+		record["phone"] !== undefined ||
+		record["hours"] !== undefined ||
+		record["isOpen"] !== undefined ||
+		record["businessStatus"] !== undefined ||
+		record["latitude"] !== undefined ||
+		record["longitude"] !== undefined ||
+		nested["address"] !== undefined ||
+		nested["rating"] !== undefined ||
+		nested["reviewCount"] !== undefined ||
+		nested["hours"] !== undefined ||
+		nested["isOpen"] !== undefined;
+	if (!hasMapsFields) return undefined;
+	const title = readString(record, TITLE_KEYS) ?? readString(nested, ["title", "name"]);
+	const url = readString(record, URL_KEYS) ?? readString(nested, ["url", "link", "website"]); 
+	const address = readString(record, ["address", "formattedAddress", "address_text"]) ?? readString(nested, ["address", "formattedAddress"]);
+	const rating = readNumber(record, ["rating", "averageRating", "ratingValue"]) ?? readNumber(nested, ["rating", "averageRating"]);
+	const reviewCount = readNumber(record, ["reviewCount", "reviews", "reviewCountInt"]) ?? readNumber(nested, ["reviewCount", "reviews"]);
+	const priceLevel = readNumber(record, ["priceLevel", "price_level", "priceRange"]) ?? readNumber(nested, ["priceLevel", "price_level"]);
+	const category = readString(record, ["category", "type", "businessType", "plusCode"]) ?? readString(nested, ["category", "type"]);
+	const phone = readString(record, ["phone", "phoneNumber", "telephone"]) ?? readString(nested, ["phone", "phoneNumber"]);
+	const hours = readString(record, ["hours", "openingHours", "businessHours"]) ?? readString(nested, ["hours", "openingHours"]);
+	const isOpen = record["isOpen"] !== undefined ? Boolean(record["isOpen"]) : undefined;
+	const snippet = readString(record, SNIPPET_KEYS) ?? readString(nested, SNIPPET_KEYS);
+	const source = readString(record, SOURCE_KEYS) ?? readString(nested, SOURCE_KEYS);
+	if (!title && !url) return undefined;
+	return { title: title ?? "Untitled", url: url ?? "", address, rating, reviewCount, priceLevel, category, phone, hours, isOpen, snippet, source };
+}
+
 export function normalizeItems(rawItems: unknown[]): SearchResultItem[] {
 	const seen = new Set<string>();
 	const items: SearchResultItem[] = [];
@@ -210,6 +424,9 @@ export function normalizeItems(rawItems: unknown[]): SearchResultItem[] {
 		const record = asRecord(entry);
 		const image = readImage(record);
 		const news = readNews(record);
+		const scholar = readScholar(record);
+		const patents = readPatents(record);
+		const maps = readMaps(record);
 		const url = readString(record, URL_KEYS) ?? image?.contextLink ?? image?.src ?? "";
 		const title = readString(record, TITLE_KEYS) ?? url ?? "Untitled result";
 		const dedupeKey = url || title;
@@ -217,7 +434,7 @@ export function normalizeItems(rawItems: unknown[]): SearchResultItem[] {
 			if (seen.has(dedupeKey)) continue;
 			seen.add(dedupeKey);
 		}
-		items.push({
+		const item: SearchResultItem = {
 			title,
 			url,
 			snippet: readString(record, SNIPPET_KEYS) ?? "",
@@ -229,7 +446,12 @@ export function normalizeItems(rawItems: unknown[]): SearchResultItem[] {
 			image,
 			news,
 			price: readString(record, ["price", "productPrice", "priceFormated"]),
-		});
+		};
+		// Only add scholar/patents/maps when they have actual data.
+		if (scholar) item.scholar = scholar;
+		if (patents) item.patents = patents;
+		if (maps) item.maps = maps;
+		items.push(item);
 	}
 	return items;
 }
@@ -571,4 +793,110 @@ function classifyFailure(error: unknown, timeout: AbortSignal, timeoutMs: number
 	if (timeout.aborted) throw new SearloError("timeout", `Searlo request timed out after ${timeoutMs}ms`);
 	const message = error instanceof Error ? error.message : String(error);
 	throw new SearloError("network", `Searlo request failed: ${message}`);
+}
+
+/** The webpage reader endpoint: takes a URL and returns extracted text. */
+const WEBPAGE_PATH = "/api/v1/search/webpage";
+
+export interface ReadWebpageOptions {
+	key: string;
+	signal?: AbortSignal;
+	/** When set, limits the extracted content to this many characters. */
+	maxChars?: number;
+}
+
+/**
+ * Extract text from a web page via the Searlo webpage reader.
+ *
+ *   GET {baseUrl}/api/v1/search/webpage?url=…&maxChars=…
+ *
+ *   {
+ *     "success": true,
+ *     "url": "https://example.com/article",
+ *     "title": "Article Title",
+ *     "content": "Extracted text…",
+ *     "wordCount": 1234,
+ *     "readTime": 5
+ *   }
+ */
+export async function readWebpage(settings: SearloSettings, url: string, options: ReadWebpageOptions): Promise<WebpageResult> {
+	if (!options.key) {
+		throw new WebpageError("no-key", "no Searlo API key configured — run /searlo login or set the key in searlo.json");
+	}
+
+	// Validate the URL before sending.
+	try {
+		new URL(url);
+	} catch {
+		throw new WebpageError("url", `invalid URL: ${excerpt(url, 200)}`);
+	}
+
+	let requestUrl: URL;
+	try {
+		requestUrl = new URL(`${settings.baseUrl}${WEBPAGE_PATH}`);
+	} catch {
+		throw new WebpageError(
+			"shape",
+			`invalid Searlo endpoint config: baseUrl="${settings.baseUrl}" ${WEBPAGE_PATH} must combine into a valid URL`,
+		);
+	}
+
+	requestUrl.searchParams.set("url", url);
+	const maxChars = options.maxChars ?? settings.contentBudgetChars;
+	requestUrl.searchParams.set("maxChars", String(maxChars));
+
+	const timeout = AbortSignal.timeout(settings.timeoutMs);
+	const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
+
+	let response: Response;
+	try {
+		response = await fetch(requestUrl, {
+			method: "GET",
+			headers: { [settings.apiKeyHeader]: options.key, accept: "application/json" },
+			signal,
+		});
+	} catch (error) {
+		if (options.signal?.aborted) throw error;
+		if (timeout.aborted) throw new WebpageError("timeout", `webpage reader timed out after ${settings.timeoutMs}ms`);
+		const message = error instanceof Error ? error.message : String(error);
+		throw new WebpageError("network", `webpage reader failed: ${message}`);
+	}
+
+	let text: string;
+	try {
+		text = await response.text();
+	} catch (error) {
+		throw new WebpageError("network", `failed to read response: ${error instanceof Error ? error.message : String(error)}`);
+	}
+
+	if (!response.ok) {
+		const kind = (ERROR_KIND_BY_STATUS[response.status] ?? "http") as WebpageErrorKind;
+		const parsed = parseJson(text);
+		const detail = parsed.parsed ? describeErrorBody(asRecord(parsed.value)) : undefined;
+		throw new WebpageError(kind, `webpage reader returned HTTP ${response.status}: ${detail ?? excerpt(text, 200)}`, response.status);
+	}
+
+	const parsed = parseJson(text);
+	if (!parsed.parsed) {
+		throw new WebpageError("shape", `expected JSON from ${settings.baseUrl}${WEBPAGE_PATH}, got ${excerpt(text, 200)}`);
+	}
+
+	const envelope = asRecord(parsed.value);
+	if (envelope["success"] === false) {
+		const message = readString(envelope, ["error", "message", "detail"]) ?? "unspecified error";
+		throw new WebpageError("api", `webpage reader reported success:false — ${message}`);
+	}
+
+	// The documented shape nests fields under `data`; a flat body is tolerated too.
+	const data = asRecord(envelope["data"]);
+	const record = Object.keys(data).length > 0 ? data : envelope;
+
+	return {
+		url: readString(record, ["url"]) ?? url,
+		title: readString(record, ["title", "heading"]),
+		content: readString(record, ["content", "text", "body", "extracted"]) ?? "",
+		wordCount: readNumber(record, ["wordCount", "word_count"]),
+		readTime: readNumber(record, ["readTime", "read_time", "minutes"]),
+		source: readString(record, ["source", "domain"]),
+	};
 }

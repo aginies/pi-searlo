@@ -38,8 +38,8 @@ import {
 	type SearloMode,
 	type SearloSettings,
 } from "./config.ts";
-import { SearloError, creditBalance, resultCount, search, type SearchResponse } from "./client.ts";
-import { CONTEXT_TYPE, describeBalance, describeRaw, formatError, formatResults, summarize } from "./format.ts";
+import { SearloError, creditBalance, resultCount, search, readWebpage, type SearchResponse, type WebpageResult } from "./client.ts";
+import { CONTEXT_TYPE, describeBalance, describeRaw, formatError, formatResults, summarize, formatWebpage } from "./format.ts";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const TOOL_NAME = "searlo_search";
@@ -59,6 +59,23 @@ const VERTICAL_STATUS: Record<SearchVertical, string> = {
 	news: "News",
 	videos: "Video",
 	shopping: "Shopping",
+	scholar: "Scholar",
+	patents: "Patents",
+	site: "Site",
+	maps: "Maps",
+};
+
+/** Human-readable description per vertical, used in the picker and tool descriptions. */
+const VERTICAL_DESCRIPTION: Record<SearchVertical, string> = {
+	web: "web pages",
+	images: "images with sizes and source pages",
+	news: "dated news articles",
+	videos: "videos with source",
+	shopping: "products with prices",
+	scholar: "academic papers with citations",
+	patents: "patent records with numbers",
+	site: "results from a single domain",
+	maps: "local businesses with ratings and hours",
 };
 
 const MODE_CHOICES: { mode: SearloMode; label: string }[] = [
@@ -75,6 +92,11 @@ function toolEnabled(mode: SearloMode): boolean {
 
 /** The one mode where no request may leave the machine, not even one you ask for by hand. */
 function searchForbidden(mode: SearloMode): boolean {
+	return mode === "off";
+}
+
+/** Whether the current mode allows a /searlo read (webpage extraction) call. */
+function readForbidden(mode: SearloMode): boolean {
 	return mode === "off";
 }
 
@@ -131,6 +153,27 @@ let toonOverride: boolean | undefined;
 
 /** query|limit|page -> response, so one turn never pays for the same search twice. */
 const turnCache = new Map<string, SearchResponse>();
+
+/** Search history: last 10 searches, each with query, vertical, and timestamp. */
+interface SearchHistoryEntry {
+	query: string;
+	vertical: SearchVertical;
+	timestamp: number;
+	count: number;
+}
+const searchHistory: SearchHistoryEntry[] = [];
+const MAX_HISTORY = 10;
+
+function pushHistory(query: string, vertical: SearchVertical, count: number): void {
+	searchHistory.unshift({ query, vertical, timestamp: Date.now(), count });
+	if (searchHistory.length > MAX_HISTORY) searchHistory.length = MAX_HISTORY;
+}
+
+function describeHistoryEntry(entry: SearchHistoryEntry, index: number): string {
+	const time = new Date(entry.timestamp).toLocaleTimeString();
+	const vertical = entry.vertical === "web" ? "" : ` [${entry.vertical}]`;
+	return `  ${index + 1}. [${time}]${vertical} "${entry.query}" → ${entry.count} result(s)`;
+}
 
 function refreshConfig(cwd?: string, force = false): Session {
 	const loaded = loadConfig({ cwd, force });
@@ -231,7 +274,7 @@ const searchParams = Type.Object({
 		Type.String({
 			enum: [...VERTICAL_NAMES],
 			description:
-				"What to search: web (pages, default), images (pictures with sizes and source pages), news (dated articles), videos, or shopping (products with prices)",
+				"What to search: web (pages, default), images (pictures with sizes and source pages), news (dated articles), videos, shopping (products with prices), scholar (academic papers), patents (patent records), site (domain-restricted search), or maps (local businesses with ratings and hours)",
 		}),
 	),
 	limit: Type.Optional(
@@ -248,8 +291,8 @@ const searchTool = defineTool({
 	name: TOOL_NAME,
 	label: "Searlo search",
 	description:
-		"Search the live web through Searlo: pages, images, news, videos or products, with dated results and URLs. Use for anything current, recent, version-specific, or outside your knowledge.",
-	promptSnippet: "Search the live web via Searlo (web, images, news, videos, shopping) for fresh, citable results.",
+		"Search the live web through Searlo: pages, images, news, videos, products, scholar papers, patents, site-restricted, or local maps with ratings and hours. Use for anything current, recent, version-specific, or outside your knowledge.",
+	promptSnippet: "Search the live web via Searlo (web, images, news, videos, shopping, scholar, patents, site, maps) for fresh, citable results.",
 	promptGuidelines: [
 		"Use searlo_search before answering questions about recent events, releases, prices, or anything time-sensitive.",
 		"Pick the vertical that matches the ask: images for pictures, news for dated reporting, videos, shopping for products with prices, web otherwise.",
@@ -353,10 +396,10 @@ async function openPicker(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void
 	if (choice.startsWith("◆")) {
 		const picked = await ctx.ui.select(
 			`Searlo search type (currently ${VERTICAL_STATUS[vertical]})`,
-			VERTICAL_NAMES.map((name) => `${name === vertical ? "●" : "○"} ${name}`),
+			VERTICAL_NAMES.map((name) => `${name === vertical ? "●" : "○"} ${name} (${VERTICAL_DESCRIPTION[name]})`),
 		);
 		if (!picked) return;
-		const next = picked.slice(2).trim();
+		const next = picked.slice(2).trim().split(" (")[0];
 		if (isVertical(next)) {
 			verticalOverride = next;
 			updateStatus(ctx);
@@ -417,7 +460,7 @@ function setDefaultMode(mode: SearloMode, pi: ExtensionAPI, ctx: ExtensionComman
  */
 function splitVertical(words: string[]): { vertical?: SearchVertical; query: string } {
 	const head = words[0] ?? "";
-	const match = /^(web|images|news|videos|shopping):$/i.exec(head);
+	const match = /^(web|images|news|videos|shopping|scholar|patents|site):$/i.exec(head);
 	if (match && words.length > 1) {
 		return { vertical: match[1].toLowerCase() as SearchVertical, query: words.slice(1).join(" ").trim() };
 	}
@@ -586,6 +629,160 @@ async function handleSearloArgs(args: string, pi: ExtensionAPI, ctx: ExtensionCo
 		return;
 	}
 
+	if (sub === "read") {
+		// Webpage extraction: reads a URL and returns extracted text.
+		if (readForbidden(state.settings.mode)) return notifyOff(state, ctx);
+		const url = rest.join(" ").trim();
+		if (!url) {
+			ctx.ui.notify(`usage: /searlo read <url>`, "warning");
+			return;
+		}
+		if (!state.key.key) {
+			ctx.ui.notify(`searlo: no API key — ${configError(state) ?? "configure one"}`, "warning");
+			return;
+		}
+		ctx.ui.notify(`searlo: reading ${url}…`, "info");
+		try {
+			const result = await readWebpage(state.settings, url, { key: state.key.key, signal: ctx.signal });
+			ctx.ui.notify(`searlo read ok — ${result.wordCount ?? "?"} words, ${result.readTime ?? "?"}min read time`, "info");
+			await pi.sendUserMessage(
+				[
+					`Answer the question below using the webpage content that follows.`,
+					"",
+					formatWebpage(result, { includeCitations: state.settings.includeCitations, budgetChars: state.settings.contentBudgetChars }),
+					"",
+					`Question: ${url}`,
+				].join("\n"),
+			);
+		} catch (error) {
+			ctx.ui.notify(`searlo failed: ${formatError(error)}`, "error");
+		}
+		return;
+	}
+
+	if (sub === "site") {
+		// Site-restricted search: /searlo site <domain>: <query>
+		if (searchForbidden(state.settings.mode)) return notifyOff(state, ctx);
+		// Parse "domain: query" — the colon separates the domain from the query.
+		const siteMatch = rest.join(" ").match(/^(https?:\/\/)?([\w.-]+)(?::\s*)(.+)$/);
+		if (!siteMatch || !siteMatch[3]) {
+			ctx.ui.notify(`usage: /searlo site <domain>: <query>`, "warning");
+			return;
+		}
+		const domain = siteMatch[2].replace(/^www\./, "");
+		const query = siteMatch[3].trim();
+		if (!query) {
+			ctx.ui.notify(`usage: /searlo site <domain>: <query>`, "warning");
+			return;
+		}
+		ctx.ui.notify(`searlo: searching ${domain} for "${query}"…`, "info");
+		try {
+			const response = await runSearch(state, query, { vertical: "site", page: 1 });
+			// Override the site parameter for this search.
+			const siteResponse = { ...response };
+			if (!siteResponse.information) siteResponse.information = {};
+			siteResponse.information.site = domain;
+			if (resultCount(siteResponse) === 0) {
+				ctx.ui.notify(`searlo found nothing on ${domain} for "${query}"`, "warning");
+				return;
+			}
+			await pi.sendUserMessage(
+				[
+					`Answer the question below using the fresh Searlo site-restricted results that follow.`,
+					"",
+					contextBlock(siteResponse, state),
+					"",
+					`Question: ${query} (site: ${domain})`,
+				].join("\n"),
+			);
+		} catch (error) {
+			ctx.ui.notify(`searlo failed: ${formatError(error)}`, "error");
+		}
+		return;
+	}
+
+	if (sub === "batch") {
+		// Batch search: /searlo batch q1 q2 q3 — runs multiple queries in parallel.
+		if (searchForbidden(state.settings.mode)) return notifyOff(state, ctx);
+		const queries = rest.filter((q) => q.trim());
+		if (queries.length < 2) {
+			ctx.ui.notify(`usage: /searlo batch <query1> [query2] [query3]… (at least 2 queries)`, "warning");
+			return;
+		}
+		ctx.ui.notify(`searlo: running ${queries.length} searches in parallel…`, "info");
+		try {
+			const results = await Promise.all(
+				queries.map(async (q) => {
+					const response = await runSearch(state, q.trim());
+					pushHistory(q.trim(), response.vertical, resultCount(response));
+					return response;
+				}),
+			);
+			const total = results.reduce((sum, r) => sum + resultCount(r), 0);
+			ctx.ui.notify(`searlo batch ok — ${total} result(s) from ${results.length} queries`, "info");
+			// Inject all results as one combined context block.
+			const blocks = results.map(
+				(r, i) =>
+					`--- Search ${i + 1}: "${r.query}" (${r.vertical}) ---\n${contextBlock(r, state)}`,
+			);
+			await pi.sendUserMessage(
+				[
+					`Answer the question below using the fresh Searlo batch search results that follow.`,
+					"",
+					blocks.join("\n\n"),
+					"",
+					`Question: ${args.trim()}`,
+				].join("\n"),
+			);
+		} catch (error) {
+			ctx.ui.notify(`searlo batch failed: ${formatError(error)}`, "error");
+		}
+		return;
+	}
+
+	if (sub === "history") {
+		// Show search history.
+		if (searchHistory.length === 0) {
+			ctx.ui.notify("searlo: no search history yet", "info");
+			return;
+		}
+		const lines = searchHistory.map((entry, i) => describeHistoryEntry(entry, i));
+		lines.push("");
+		lines.push(`Use /searlo replay <index> to re-run a previous search.`);
+		ctx.ui.notify(lines.join("\n"), "info");
+		return;
+	}
+
+	if (sub === "replay") {
+		// Re-run a previous search by index.
+		const idx = parseInt(rest[0] ?? "", 10);
+		if (Number.isNaN(idx) || idx < 0 || idx >= searchHistory.length) {
+			ctx.ui.notify(`usage: /searlo replay <index>  (0-${searchHistory.length - 1})`, "warning");
+			return;
+		}
+		const entry = searchHistory[idx];
+		ctx.ui.notify(`searlo: replaying "${entry.query}" (${entry.vertical})…`, "info");
+		try {
+			const response = await runSearch(state, entry.query, { vertical: entry.vertical });
+			if (resultCount(response) === 0) {
+				ctx.ui.notify(`searlo replay found nothing for "${entry.query}"`, "warning");
+				return;
+			}
+			await pi.sendUserMessage(
+				[
+					`Answer the question below using the fresh Searlo results that follow.`,
+					"",
+					contextBlock(response, state),
+					"",
+					`Question: ${entry.query}`,
+				].join("\n"),
+			);
+		} catch (error) {
+			ctx.ui.notify(`searlo replay failed: ${formatError(error)}`, "error");
+		}
+		return;
+	}
+
 	// Default: run a search and inject it as extra context for the next answer.
 	if (searchForbidden(state.settings.mode)) return notifyOff(state, ctx);
 	const target = splitVertical(args.trim().split(/\s+/).filter(Boolean));
@@ -594,7 +791,7 @@ async function handleSearloArgs(args: string, pi: ExtensionAPI, ctx: ExtensionCo
 		ctx.ui.notify(
 			[
 				`mode: ${state.settings.mode} · vertical: ${state.settings.vertical} · key: ${state.key.key ? describeKey(state) : "not configured"}`,
-				`/searlo <query> · /searlo ${VERTICAL_NAMES.join("|")}: <query> · /searlo off|manual|on|auto · /searlo toon on|off · /searlo vertical <name> · /searlo test · /searlo credits · /searlo config`,
+				`/searlo <query> · /searlo ${VERTICAL_NAMES.join("|")}: <query> · /searlo batch <q1> <q2>… · /searlo history · /searlo replay <n> · /searlo site <domain>: <query> · /searlo read <url> · /searlo off|manual|on|auto · /searlo toon on|off · /searlo vertical <name> · /searlo test · /searlo credits · /searlo config`,
 			].join("\n"),
 			"info",
 		);
@@ -603,8 +800,9 @@ async function handleSearloArgs(args: string, pi: ExtensionAPI, ctx: ExtensionCo
 
 	try {
 		const response = await runSearch(state, query, { vertical: target.vertical });
+		pushHistory(query, response.vertical, resultCount(response));
 		if (resultCount(response) === 0) {
-			ctx.ui.notify(`searlo found nothing for “${query}”`, "warning");
+			ctx.ui.notify(`searlo found nothing for "${query}"`, "warning");
 			return;
 		}
 		await pi.sendUserMessage(
@@ -641,9 +839,9 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("searlo", {
-		description: `Search the web via Searlo: /searlo <query> | images:\u003cquery> | off | manual | on | auto | toon on|off | vertical <name> | test | credits | login | config | init (${binding} opens the picker)`,
+		description: `Search the web via Searlo: /searlo <query> | images:\u003cquery> | batch | history | replay | off | manual | on | auto | toon on|off | vertical <name> | test | credits | login | config | init (${binding} opens the picker)`,
 		getArgumentCompletions: (prefix) => {
-			const words = ["off", "manual", "on", "auto", "toon", "test", "credits", "balance", "config", "login", "init", "raw", "vertical", "default", ...VERTICAL_NAMES];
+			const words = ["off", "manual", "on", "auto", "toon", "test", "credits", "balance", "config", "login", "init", "raw", "vertical", "default", "batch", "history", "replay", ...VERTICAL_NAMES];
 			const head = prefix.trim();
 			const hits = words.filter((word) => word.startsWith(head));
 			return hits.length ? hits.map((label) => ({ value: `${label} `, label })) : null;
@@ -659,6 +857,7 @@ export default function (pi: ExtensionAPI) {
 		verticalOverride = undefined;
 		toonOverride = undefined;
 		turnCache.clear();
+		searchHistory.length = 0;
 		const state = refreshConfig(ctx.cwd);
 		syncTools(pi);
 		updateStatus(ctx);

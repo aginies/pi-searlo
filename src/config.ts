@@ -32,8 +32,8 @@ export const MAX_LIMIT = 10;
  */
 export type SearloMode = "off" | "manual" | "tool" | "auto";
 
-/** The five Searlo search endpoints. */
-export type SearchVertical = "web" | "images" | "news" | "videos" | "shopping";
+/** The nine Searlo search endpoints. */
+export type SearchVertical = "web" | "images" | "news" | "videos" | "shopping" | "scholar" | "patents" | "site" | "maps";
 
 export interface VerticalSpec {
 	/** Default path appended to baseUrl. */
@@ -97,6 +97,42 @@ export const VERTICALS: Record<SearchVertical, VerticalSpec> = {
 		listKeys: ["shopping", "items", "results"],
 		itemLabel: "product",
 	},
+	scholar: {
+		path: "/api/v1/search/scholar",
+		minLimit: 1,
+		maxLimit: 10,
+		defaultLimit: 5,
+		paginated: true,
+		listKeys: ["items", "results", "papers", "scholar"],
+		itemLabel: "paper",
+	},
+	patents: {
+		path: "/api/v1/search/patents",
+		minLimit: 1,
+		maxLimit: 10,
+		defaultLimit: 5,
+		paginated: true,
+		listKeys: ["items", "results", "patents"],
+		itemLabel: "patent",
+	},
+	site: {
+		path: "/api/v1/search/site",
+		minLimit: 1,
+		maxLimit: 10,
+		defaultLimit: 5,
+		paginated: true,
+		listKeys: ["items", "results", "site"],
+		itemLabel: "result",
+	},
+	maps: {
+		path: "/api/v1/search/maps",
+		minLimit: 1,
+		maxLimit: 10,
+		defaultLimit: 5,
+		paginated: false,
+		listKeys: ["items", "results", "places", "local"],
+		itemLabel: "place",
+	},
 };
 
 export const VERTICAL_NAMES = Object.keys(VERTICALS) as SearchVertical[];
@@ -148,6 +184,10 @@ export interface SearloSettings {
 	shortcut: string;
 	/** Show "Searlo: <vertical>" in the bottom bar whenever searching is enabled. */
 	showStatus: boolean;
+	/** Domain restriction for site-restricted search (e.g. "arxiv.org"). */
+	site?: string;
+	/** Location for maps search: "lat,lng,radius" (e.g. "40.7128,-74.0060,5000") or a named place. */
+	mapsLocation?: string;
 	/** Regex/validation problems found while loading. Never contains secrets. */
 	errors?: string[];
 	/** Only used when mode is "auto". */
@@ -196,6 +236,21 @@ export const DEFAULT_SETTINGS: SearloSettings = {
 export function agentDir(): string {
 	const fromEnv = process.env.PI_CODING_AGENT_DIR;
 	return fromEnv ? resolve(fromEnv.replace(/^~/, homedir())) : join(homedir(), ".pi", "agent");
+}
+
+/** Normalise a site domain: strip protocol, trailing slash, and leading www. */
+export function normaliseSite(value: string | undefined): string | undefined {
+	if (!value) return undefined;
+	let cleaned = value.trim();
+	if (cleaned.startsWith("http://") || cleaned.startsWith("https://")) {
+		try {
+			const url = new URL(cleaned);
+			cleaned = url.hostname.replace(/^www\./, "");
+		} catch {
+			// Fall through — keep the raw value if URL parsing fails.
+		}
+	}
+	return cleaned.replace(/\/+$/, "");
 }
 
 export function userConfigPath(): string {
@@ -354,6 +409,7 @@ function normalize(settings: SearloSettings): SearloSettings {
 		includeCitations: settings.includeCitations !== false,
 		shortcut: normalizeShortcut(settings.shortcut),
 		showStatus: normalizeBool(settings.showStatus, true),
+		site: normaliseSite(settings.site),
 		auto: {
 			triggerPatterns: stringList(settings.auto?.triggerPatterns, DEFAULT_SETTINGS.auto.triggerPatterns).filter(check),
 			skipPatterns: stringList(settings.auto?.skipPatterns, DEFAULT_SETTINGS.auto.skipPatterns).filter(check),
@@ -386,6 +442,7 @@ function merge(base: SearloSettings, layer: Record<string, unknown> | undefined)
 			: base.auto,
 	};
 	if (typeof merged.baseUrl === "string") merged.baseUrl = merged.baseUrl.trim().replace(/\/+$/, "");
+	if (typeof merged.site === "string") merged.site = normaliseSite(merged.site);
 	return merged;
 }
 
@@ -495,7 +552,7 @@ export function defaultConfigTemplate(): string {
 		baseUrl: DEFAULT_SETTINGS.baseUrl,
 		apiKey: `env:${DEFAULT_API_KEY_ENV}`,
 		apiKeyHeader: DEFAULT_SETTINGS.apiKeyHeader,
-		// web | images | news | videos | shopping — the vertical used when a search names none.
+		// web | images | news | videos | shopping | scholar | patents | site — the vertical used when a search names none.
 		vertical: DEFAULT_SETTINGS.vertical,
 		// Per-vertical paths, only needed if Searlo renames an endpoint.
 		endpoints: defaultEndpoints(),
@@ -511,8 +568,10 @@ export function defaultConfigTemplate(): string {
 		timeoutMs: 8000,
 		contentBudgetChars: 6000,
 		// Passed through verbatim: gl/hl for locale, size for images,
-		// safe for videos.
+		// safe for videos, site for domain-restricted search.
 		params: { hl: "en", gl: "us" },
+		// Restricts web/site searches to one domain, e.g. "arxiv.org".
+		// site: "arxiv.org",
 	};
 	return `${JSON.stringify(template, null, "\t")}\n`;
 }
