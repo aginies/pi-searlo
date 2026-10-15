@@ -12,8 +12,7 @@
         },
         "repository": {
                 "type": "git",
-                "url": "https://github.com/aginies/pi-searlo",
-                "directory": "extensions/pi-searlo"
+                "url": "https://github.com/aginies/pi-searlo"
         },
         "homepage": "https://github.com/aginies/pi-searlo",
 	"bugs": {
@@ -32,9 +31,8 @@
 		"README.md"
 	],
 	"peerDependencies": {
-		"@earendil-works/pi-coding-agent": ">=1.0.0",
-		"@earendil-works/pi-tui": "*",
-		"typebox": ">=1.0.0"
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-ai": "*"
 	},
 	"scripts": {
 		"test": "node --disable-warning=ExperimentalWarning --test 'test/**/*.test.ts'",

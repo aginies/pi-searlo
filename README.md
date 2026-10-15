@@ -64,6 +64,17 @@ with mode `0600`, or as `"apiKey"` in that file. The full resolution order is be
 }
 ```
 
+The `params` object passes extra query parameters through to the Searlo API. Common values:
+
+| Param | Meaning | Example values |
+|---|---|---|
+| `gl` | **Geolocation / country** — which country's results to return | `"us"` (United States), `"gb"` (UK), `"fr"` (France), `"de"` (Germany) |
+| `hl` | **Host language** — language of titles and snippets | `"en"` (English), `"fr"` (French), `"de"` (German), `"ja"` (Japanese) |
+| `safe` | **Safe search** (videos vertical) | `"active"` or `"off"` |
+| `size` | **Image size** (images vertical) | `"small"`, `"medium"`, `"large"`, `"xlarge"` |
+
+These are merged with the defaults, so you only need to specify what you want to change.
+
 The API key is resolved in this order, first hit wins:
 
 1. `process.env.SEARLO_API_KEY` (override the name with `apiKeyEnv`)
