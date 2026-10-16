@@ -557,11 +557,10 @@ export async function search(settings: SearloSettings, query: string, options: S
 	}
 
 	const elapsedMs = Date.now() - started;
-	if (!response.ok) {
-		throw apiFailure(response.status, text);
-	}
-
 	const parsed = parseJson(text);
+	if (!response.ok) {
+		throw apiFailure(response.status, text, parsed);
+	}
 	if (!parsed.parsed) {
 		// A server that honours format=toon answers TOON text, not JSON. Hand it to the model exactly
 		// as it arrived instead of reporting a shape failure: that text is the point of the option.
@@ -756,10 +755,10 @@ const ERROR_KIND_BY_STATUS: Record<number, SearloErrorKind> = {
 const CREDIT_BALANCE_PATH = "/api/v1/credit/balance";
 
 /** Map a non-OK HTTP response to the matching SearloError: the core mapping, with no credits pointer. */
-function httpFailure(status: number, body: string): SearloError {
+function httpFailure(status: number, body: string, parsed?: JsonPayload): SearloError {
 	const kind = ERROR_KIND_BY_STATUS[status] ?? "http";
-	const parsed = parseJson(body);
-	const detail = parsed.parsed ? describeErrorBody(asRecord(parsed.value)) : undefined;
+	const resolved = parsed ?? parseJson(body);
+	const detail = resolved.parsed ? describeErrorBody(asRecord(resolved.value)) : undefined;
 	const message = detail ?? excerpt(body);
 	// A 402 is not an outage: the account has run out of credits, and the fix is an action, not a retry.
 	const hint = status === 402 ? ` — the account has run out of credits: top up at ${SEARLO_DASHBOARD_URL}` : "";
@@ -767,8 +766,8 @@ function httpFailure(status: number, body: string): SearloError {
 }
 
 /** A failed paid call: same mapping, plus the pointer to the free balance command. */
-function apiFailure(status: number, body: string): SearloError {
-	const error = httpFailure(status, body);
+function apiFailure(status: number, body: string, parsed?: JsonPayload): SearloError {
+	const error = httpFailure(status, body, parsed);
 	if (status !== 402) return error;
 	return new SearloError(error.kind, `${error.message} (balance: /searlo credits)`, status);
 }

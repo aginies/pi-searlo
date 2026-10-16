@@ -125,6 +125,10 @@ interface Session {
 	sources: string[];
 	/** Live tool state so disabled modes do not expose the tool. */
 	toolActive: boolean;
+	/** Cache key from loadConfig() (file mtimes); used to detect config changes without rebuilding. */
+	configStamp: string;
+	/** Base settings without session overrides; reused across refreshConfig calls until config changes. */
+	base: SearloSettings;
 }
 
 let session: Session | undefined;
@@ -177,15 +181,22 @@ function describeHistoryEntry(entry: SearchHistoryEntry, index: number): string 
 
 function refreshConfig(cwd?: string, force = false): Session {
 	const loaded = loadConfig({ cwd, force });
-	// Clone before overriding: loaded.settings may be the object config.ts caches, and mutating it
-	// in place would make a session toggle look like the value that came from the file.
-	const settings: SearloSettings = { ...loaded.settings };
+	// cacheKey is computed from the config files' mtimes in loadConfig(); a matching stamp means the
+	// cached base is still valid and only a force (or a real file change) rebuilds it.
+	const currentStamp = loaded.cacheKey;
+	// Cache the base settings WITHOUT session-only overrides, so the cached base is never mutated and
+	// a later override removal (e.g. the session_start reset) cannot leak: overrides are always
+	// applied to a fresh copy, on every call.
+	const base: SearloSettings = !force && session && session.configStamp === currentStamp ? session.base : { ...loaded.settings };
+	const settings: SearloSettings = { ...base };
 	if (modeOverride) settings.mode = modeOverride;
 	if (verticalOverride) settings.vertical = verticalOverride;
 	if (toonOverride !== undefined) settings.toon = toonOverride;
+	// Key and tool state are computed from the effective settings each call, so env key changes and
+	// session overrides keep working even when the base comes from the cache.
 	const local = resolveKeyFromLocal(settings);
 	const key: ResolvedKey = local.key ? local : storedCredentialKey() ?? { ...local, source: "none" as const };
-	session = { settings, key, sources: loaded.sources, toolActive: toolEnabled(settings.mode) };
+	session = { settings, key, sources: loaded.sources, toolActive: toolEnabled(settings.mode), configStamp: currentStamp, base };
 	return session;
 }
 
@@ -922,6 +933,6 @@ export default function (pi: ExtensionAPI) {
 
 function shouldAutoSearch(prompt: string, settings: SearloSettings): boolean {
 	if (prompt.trim().length < settings.auto.minPromptChars) return false;
-	if (settings.auto.skipPatterns.some((pattern) => new RegExp(pattern, "i").test(prompt))) return false;
-	return settings.auto.triggerPatterns.some((pattern) => new RegExp(pattern, "i").test(prompt));
+	if (settings.auto.skipRegex.some((re) => re.test(prompt))) return false;
+	return settings.auto.triggerRegex.some((re) => re.test(prompt));
 }

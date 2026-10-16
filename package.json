@@ -1,6 +1,6 @@
 {
 	"name": "pi-searlo",
-	"version": "0.1.4",
+	"version": "0.1.5",
 	"description": "Perplexity-style fresh web data for pi, backed by the Searlo search API",
         "author": {
                 "name": "aginies",

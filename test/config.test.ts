@@ -109,8 +109,39 @@ test("invalid auto regexes are skipped and reported", () => {
 		assert.deepEqual(settings.auto.triggerPatterns, ["latest"]);
 		// An explicit array is respected even when every entry is junk: it means "no patterns".
 		assert.deepEqual(settings.auto.skipPatterns, []);
+		// The compiled arrays mirror the string lists: junk never reaches a RegExp.
+		assert.equal(settings.auto.triggerRegex.length, 1, "the invalid pattern must not reach the compiled array");
+		assert.equal(settings.auto.skipRegex.length, 0);
+		assert.ok(settings.auto.triggerRegex[0].test("latest"));
 		assert.equal(errors.length, 1);
 		assert.match(errors[0], /invalid regex skipped: \(unbalanced/);
+	});
+});
+
+test("auto patterns are compiled to case-insensitive regexes at load", () => {
+	withAgentDir((dir) => {
+		writeAgentConfig(dir, { auto: { triggerPatterns: ["Latest"], skipPatterns: ["^bye"] } });
+		const { settings } = loadConfig({ force: true });
+		assert.equal(settings.auto.triggerRegex.length, 1);
+		assert.equal(settings.auto.skipRegex.length, 1);
+		assert.ok(settings.auto.triggerRegex[0].test("the latest news"), "matches case-insensitively");
+		assert.ok(settings.auto.triggerRegex[0].test("LATEST"), "matches the upper case too");
+		assert.ok(settings.auto.skipRegex[0].test("bye now"));
+		assert.ok(!settings.auto.skipRegex[0].test("goodbye"), "the anchor still works");
+	});
+});
+
+test("cacheKey is stable while the config is untouched and changes with it", () => {
+	withAgentDir((dir) => {
+		writeAgentConfig(dir, { limit: 3 });
+		const first = loadConfig({ force: true });
+		assert.equal(typeof first.cacheKey, "string");
+		assert.ok(first.cacheKey.length > 0);
+		assert.equal(loadConfig({ force: true }).cacheKey, first.cacheKey, "an unchanged file keeps its cache key");
+		writeAgentConfig(dir, { limit: 3, mode: "tool" });
+		assert.notEqual(loadConfig({ force: true }).cacheKey, first.cacheKey, "a changed file gets a new cache key");
+		rmSync(join(dir, "searlo.json"));
+		assert.notEqual(loadConfig({ force: true }).cacheKey, first.cacheKey, "a deleted file gets a new cache key");
 	});
 });
 

@@ -196,9 +196,13 @@ export interface SearloSettings {
 		triggerPatterns: string[];
 		/** Never inject when the prompt matches one of these regexes. */
 		skipPatterns: string[];
+		/** Compiled regex objects for triggerPatterns (cached at config load). */
+		triggerRegex: RegExp[];
+		/** Compiled regex objects for skipPatterns (cached at config load). */
+		skipRegex: RegExp[];
 		/** Skip trivially short prompts (characters). */
 		minPromptChars: number;
-	};
+	},
 }
 
 /** Where the account can be topped up, for messages that need to point there. */
@@ -228,6 +232,8 @@ export const DEFAULT_SETTINGS: SearloSettings = {
 			"\\b(search|look up|google|find online)\\b",
 		],
 		skipPatterns: ["^\\s*/", "\\b(hi|hello|hey|thanks|thank you)\\b"],
+		triggerRegex: [],
+		skipRegex: [],
 		minPromptChars: 24,
 	},
 };
@@ -269,6 +275,8 @@ export interface LoadedConfig {
 	errors: string[];
 	/** True when no config file was found anywhere. */
 	usingDefaults: boolean;
+	/** Cache key computed from file mtimes; used to detect config changes without rebuilding. */
+	cacheKey: string;
 }
 
 let cache: { key: string; config: LoadedConfig } | undefined;
@@ -410,12 +418,20 @@ function normalize(settings: SearloSettings): SearloSettings {
 		shortcut: normalizeShortcut(settings.shortcut),
 		showStatus: normalizeBool(settings.showStatus, true),
 		site: normaliseSite(settings.site),
-		auto: {
-			triggerPatterns: stringList(settings.auto?.triggerPatterns, DEFAULT_SETTINGS.auto.triggerPatterns).filter(check),
-			skipPatterns: stringList(settings.auto?.skipPatterns, DEFAULT_SETTINGS.auto.skipPatterns).filter(check),
+		auto: compileAutoPatterns(settings, check),
+		};
+}
+
+function compileAutoPatterns(settings: SearloSettings, check: (pattern: string) => boolean): { triggerPatterns: string[]; skipPatterns: string[]; triggerRegex: RegExp[]; skipRegex: RegExp[]; minPromptChars: number } {
+		const triggerPatterns = stringList(settings.auto?.triggerPatterns, DEFAULT_SETTINGS.auto.triggerPatterns).filter(check);
+		const skipPatterns = stringList(settings.auto?.skipPatterns, DEFAULT_SETTINGS.auto.skipPatterns).filter(check);
+		return {
+			triggerPatterns,
+			skipPatterns,
+			triggerRegex: triggerPatterns.map((p) => new RegExp(p, "i")),
+			skipRegex: skipPatterns.map((p) => new RegExp(p, "i")),
 			minPromptChars: clampInt(settings.auto?.minPromptChars, DEFAULT_SETTINGS.auto.minPromptChars, 1, 4000),
-		},
-	};
+		};
 }
 
 function validPattern(errors: string[]): (pattern: string) => boolean {
@@ -438,7 +454,10 @@ function merge(base: SearloSettings, layer: Record<string, unknown> | undefined)
 		...(scalarLayer as Partial<SearloSettings>),
 		params: isCliArg(paramsLayer) ? { ...base.params, ...(paramsLayer as Record<string, string>) } : base.params,
 		auto: isCliArg(autoLayer)
-			? { ...base.auto, ...(autoLayer as Partial<SearloSettings["auto"]>) }
+			? {
+					...base.auto,
+					...(autoLayer as Partial<SearloSettings["auto"]>),
+				  }
 			: base.auto,
 	};
 	if (typeof merged.baseUrl === "string") merged.baseUrl = merged.baseUrl.trim().replace(/\/+$/, "");
@@ -484,7 +503,7 @@ export function loadConfig(options: LoadOptions = {}): LoadedConfig {
 		settings = normalize(merge({ ...settings, errors }, index === 0 ? raw : stripSecrets(raw)));
 	}
 
-	const config: LoadedConfig = { settings, sources, errors, usingDefaults: sources.length === 0 };
+	const config: LoadedConfig = { settings, sources, errors, usingDefaults: sources.length === 0, cacheKey: stamp };
 	cache = { key: stamp ?? "-", config };
 	return config;
 }
