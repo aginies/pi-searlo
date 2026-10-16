@@ -16,7 +16,7 @@
         },
         "homepage": "https://github.com/aginies/pi-searlo",
 	"bugs": {
-                "url": "git+https://github.com/aginies/searlo/issues"
+                "url": "https://github.com/aginies/pi-searlo/issues"
         },
 	"license": "MIT",
 	"keywords": ["pi-package", "pi-extension", "search", "searlo", "web"],
